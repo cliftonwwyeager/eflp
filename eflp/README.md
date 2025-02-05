@@ -1,4 +1,4 @@
-# EFLP v0.0.4
+# EFLP v0.0.5
 
 A flask application using Neo4j for session/user management, parses firewall logs by selected vendor, uses matpoltlib to create a bar graph displaying a count of parsed logs by severity, Elasticsearch integration. Application presented over ssl/tls on **port 8443** 
 
