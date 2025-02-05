@@ -17,6 +17,7 @@ from parsers.fortigate_parser import FortigateParser
 from parsers.sonicwall_parser import SonicwallParser
 from parsers.cisco_ftd_parser import CiscoFTDParser
 from parsers.checkpoint_parser import CheckpointParser
+from parsers.meraki_parser import MerakiParser  # <-- New import
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -35,7 +36,8 @@ PARSERS = {
     "fortigate": FortigateParser,
     "sonicwall": SonicwallParser,
     "cisco_ftd": CiscoFTDParser,
-    "checkpoint": CheckpointParser
+    "checkpoint": CheckpointParser,
+    "meraki": MerakiParser  # <-- New vendor added here
 }
 
 STYLE = """
@@ -94,7 +96,7 @@ def index():
     <html>
     <head><title>EFLP</title>{STYLE}</head>
     <body>
-    <h1>EFLP v0.0.4</h1>
+    <h1>EFLP v0.0.5</h1>
     {box}
     <h2>Upload Logs</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -107,6 +109,7 @@ def index():
         <option value="sonicwall">SonicWall</option>
         <option value="cisco_ftd">Cisco FTD</option>
         <option value="checkpoint">Check Point</option>
+        <option value="meraki">Meraki</option> <!-- New option added -->
       </select><br><br>
       <label>Log File:</label><br>
       <input type="file" name="logfile" accept=".log,.txt" /><br><br>
