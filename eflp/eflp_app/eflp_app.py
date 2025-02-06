@@ -17,7 +17,7 @@ from parsers.fortigate_parser import FortigateParser
 from parsers.sonicwall_parser import SonicwallParser
 from parsers.cisco_ftd_parser import CiscoFTDParser
 from parsers.checkpoint_parser import CheckpointParser
-from parsers.meraki_parser import MerakiParser  # <-- New import
+from parsers.meraki_parser import MerakiParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -37,7 +37,7 @@ PARSERS = {
     "sonicwall": SonicwallParser,
     "cisco_ftd": CiscoFTDParser,
     "checkpoint": CheckpointParser,
-    "meraki": MerakiParser  # <-- New vendor added here
+    "meraki": MerakiParser
 }
 
 STYLE = """
