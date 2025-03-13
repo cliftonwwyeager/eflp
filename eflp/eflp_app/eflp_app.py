@@ -4,10 +4,8 @@ import uuid
 import base64
 import pytz
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from flask import Flask, request
+import plotly.express as px
+from flask import Flask, request, send_file
 from dateutil import parser as date_parser
 from elasticsearch import Elasticsearch
 from werkzeug.utils import secure_filename
@@ -47,13 +45,24 @@ h1, h2, h3, label, table, th, td, input, select, option, form, p { color:#00FF00
 a { color:#00FF00; text-decoration:none; }
 a:hover { text-decoration:underline; }
 input, select { background-color:#333; border:1px solid #00FF00; color:#00FF00; margin:5px 0; padding:5px; }
-table { border-collapse:collapse; }
+table { border-collapse:collapse; width: 100%; }
 th, td { border:1px solid #00FF00; padding:6px 8px; }
 .button { background-color:#333; color:#00FF00; border:1px solid #00FF00; padding:8px 12px; cursor:pointer; margin-top:10px; }
 .button:hover { background-color:#444; }
 .scroll-box { max-height:300px; overflow-y:auto; margin-top:20px; border:1px solid #00FF00; padding:5px; }
 .case-box { border:1px solid #00FF00; padding:5px; margin:10px 0; }
 </style>
+"""
+
+DATATABLES = """
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.10.25/css/jquery.dataTables.css">
+<script src="https://code.jquery.com/jquery-3.5.1.js"></script>
+<script src="https://cdn.datatables.net/1.10.25/js/jquery.dataTables.js"></script>
+<script>
+  $(document).ready(function() {
+    $('#logsTable').DataTable();
+  });
+</script>
 """
 
 def store_case(case_id, label, vendor, path):
@@ -96,7 +105,7 @@ def index():
     <html>
     <head><title>EFLP</title>{STYLE}</head>
     <body>
-    <h1>EFLP v0.0.5</h1>
+    <h1>EFLP v0.0.6</h1>
     {box}
     <h2>Upload Logs</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -109,7 +118,7 @@ def index():
         <option value="sonicwall">SonicWall</option>
         <option value="cisco_ftd">Cisco FTD</option>
         <option value="checkpoint">Check Point</option>
-        <option value="meraki">Meraki</option> <!-- New option added -->
+        <option value="meraki">Meraki</option>
       </select><br><br>
       <label>Log File:</label><br>
       <input type="file" name="logfile" accept=".log,.txt" /><br><br>
@@ -153,7 +162,10 @@ def view_case(case_id):
         h = df.head(10).to_html(index=False, border=0)
         return f"""
         <html>
-        <head><title>{label}</title>{STYLE}</head>
+        <head>
+            <title>{label}</title>
+            {STYLE}
+        </head>
         <body>
         <h2>Case: {label} ({vendor})</h2>
         <p>No 'severity' column found. Showing first 10 rows:</p>
@@ -174,24 +186,14 @@ def view_case(case_id):
         </body>
         </html>
         """
-    cts = df["severity"].value_counts().sort_index()
-    colors = ["red","green","blue","orange","purple","yellow","cyan","magenta","lime","pink"]
-    fig, ax = plt.subplots()
-    cts.plot(kind="bar", ax=ax, color=colors[:len(cts)])
-    ax.set_title(f"{label} Severity", color="#00FF00")
-    ax.set_xlabel("Severity", color="#00FF00")
-    ax.set_ylabel("Count", color="#00FF00")
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-        lbl.set_color("#00FF00")
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    buf.seek(0)
-    encoded_png = base64.b64encode(buf.getvalue()).decode("utf-8")
-    plt.close()
 
+    cts = df["severity"].value_counts().sort_index()
+    fig = px.bar(x=cts.index, y=cts.values,
+                 labels={"x": "Severity", "y": "Count"},
+                 title=f"{label} – Event Severity Distribution",
+                 template="plotly_dark")
+    fig.update_traces(text=cts.values, textposition='outside')
+    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
     columns = ["timestamp", "severity", "message"]
     for col in columns:
         if col not in df.columns:
@@ -202,16 +204,20 @@ def view_case(case_id):
     for rec in df_records:
         row = "<tr>" + "".join(f"<td>{rec[c]}</td>" for c in columns) + "</tr>"
         table_rows.append(row)
-    scroll_table = f"<div class='scroll-box'><table><thead>{table_head}</thead><tbody>{''.join(table_rows)}</tbody></table></div>"
+    table_html = f"<table id='logsTable'><thead>{table_head}</thead><tbody>{''.join(table_rows)}</tbody></table>"
 
     return f"""
     <html>
-    <head><title>{label}</title>{STYLE}</head>
+    <head>
+        <title>{label}</title>
+        {STYLE}
+        {DATATABLES}
+    </head>
     <body>
     <h2>Case: {label} ({vendor})</h2>
-    <img src="data:image/png;base64,{encoded_png}" alt="Severity Chart" />
+    <div>{chart_html}</div>
     <h3>Log Records</h3>
-    {scroll_table}
+    <div class='scroll-box'>{table_html}</div>
     <form action="/export" method="post">
       <input type="hidden" name="case_id" value="{case_id}" />
       <label>Elasticsearch URL:</label><br>
@@ -232,10 +238,10 @@ def view_case(case_id):
 @app.route("/export", methods=["POST"])
 def export_es():
     case_id = request.form.get("case_id")
-    es_url = request.form.get("es_url","http://localhost:9200")
-    es_index = request.form.get("es_index","logs")
-    es_user = request.form.get("es_user","")
-    es_pass = request.form.get("es_pass","")
+    es_url = request.form.get("es_url", "http://localhost:9200")
+    es_index = request.form.get("es_index", "logs")
+    es_user = request.form.get("es_user", "")
+    es_pass = request.form.get("es_pass", "")
 
     c = get_case_by_sid(case_id)
     if not c:
@@ -263,5 +269,5 @@ def export_es():
 
     return f"Logs exported to {es_index}. <a href='/case/{case_id}'>Back</a>"
     
-if __name__=="__main__":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
