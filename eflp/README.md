@@ -5,7 +5,7 @@ A flask application that parses firewall logs by selected vendor, uses matpoltli
 ## Features
 
 1. **Vendor-Specific Parsing**  
-   - Five built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Check Point.  
+   - Six built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Cisco Meraki and Check Point.  
    - Each parser extracts integer fields (ports, session IDs) and returns consistent fields (`severity`, `timestamp`, etc.).
 
 2. **Severity Chart**  
