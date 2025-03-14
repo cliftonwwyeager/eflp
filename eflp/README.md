@@ -9,7 +9,7 @@ A flask application that parses firewall logs by selected vendor, uses matpoltli
    - Each parser extracts integer fields (ports, session IDs) and returns consistent fields (`severity`, `timestamp`, etc.).
 
 2. **Severity Chart**  
-   - For each case, we generate a bar chart of log severities using `matplotlib` and embed it as a Base64-encoded image in the page.
+   - For each case, we generate a bar chart of log severities using `plotly` and `neo4j` and embed it as a Base64-encoded image in the page.
 
 3. **Elasticsearch Export**  
    - A form allows specifying ES URL, index name, and optional username/password.  
@@ -19,7 +19,7 @@ A flask application that parses firewall logs by selected vendor, uses matpoltli
 
 ## Requirements
 
-- **Docker** and (optionally) **Docker Compose**  
+- **Docker** , **Docker Compose**  
 
 ## Docker Build and Run
 
