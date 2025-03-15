@@ -107,7 +107,7 @@ def index():
     <html>
     <head><title>EFLP</title>{STYLE}</head>
     <body>
-    <h1>EFLP v0.0.6</h1>
+    <h1>EFLP v0.0.7</h1>
     {box}
     <h2>Upload Logs</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -121,6 +121,7 @@ def index():
         <option value="cisco_ftd">Cisco FTD</option>
         <option value="checkpoint">Check Point</option>
         <option value="meraki">Meraki</option>
+        <option value="unifi">Unifi</option>
       </select><br><br>
       <label>Log File:</label><br>
       <input type="file" name="logfile" accept=".log,.txt" /><br><br>
