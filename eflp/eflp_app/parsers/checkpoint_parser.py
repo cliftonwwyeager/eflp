@@ -2,7 +2,7 @@ import re
 from parsers.base_parser import BaseParser
 from datetime import datetime
 
-class CheckpointParserOptimized(BaseParser):
+class CheckpointParser(BaseParser):
     SYSLOG_REGEX = re.compile(
         r'^<(?P<priority>\d+)>(?P<month>\w{3})\s+(?P<day>\d+)\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<payload>.*)$'
     )
