@@ -93,6 +93,22 @@ def get_case_by_sid(case_id):
         r = s.run("MATCH (c:Case {sid:$sid}) RETURN c LIMIT 1", sid=case_id).single()
         return r["c"] if r else None
 
+def parse_uploaded_file(file_path, vendor):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".csv", ".tsv"]:
+        sep = "," if ext == ".csv" else "\t"
+        try:
+            df = pd.read_csv(file_path, sep=sep)
+            return df.to_dict("records")
+        except Exception as e:
+            raise Exception(f"Error parsing CSV/TSV file: {e}")
+    else:
+        parser_cls = PARSERS.get(vendor)
+        if not parser_cls:
+            raise Exception(f"Unknown vendor: {vendor}")
+        parser = parser_cls()
+        return parser.parse(file_path)
+
 @app.route("/")
 def index():
     cases = get_all_cases()
@@ -124,7 +140,7 @@ def index():
         <option value="unifi">Unifi</option>
       </select><br><br>
       <label>Log File:</label><br>
-      <input type="file" name="logfile" accept=".log,.txt" /><br><br>
+      <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" /><br><br>
       <input class="button" type="submit" value="Upload" />
     </form>
     </body>
@@ -153,12 +169,10 @@ def view_case(case_id):
     vendor = c["vendor"]
     label = c["label"]
     file_path = c["path"]
-    parser_cls = PARSERS.get(vendor)
-    if not parser_cls:
-        return f"Unknown vendor: {vendor} <a href='/'>Back</a>"
-
-    parser = parser_cls()
-    parsed_data = parser.parse(file_path)
+    try:
+        parsed_data = parse_uploaded_file(file_path, vendor)
+    except Exception as e:
+        return f"Error parsing file: {e}"
     df = pd.DataFrame(parsed_data)
 
     if "severity" not in df.columns:
@@ -251,12 +265,11 @@ def export_es():
         return "Case not found. <a href='/'>Back</a>"
     vendor = c["vendor"]
     file_path = c["path"]
-    parser_cls = PARSERS.get(vendor)
-    if not parser_cls:
-        return f"Unknown vendor: {vendor} <a href='/'>Back</a>"
-
-    parser = parser_cls()
-    parsed_data = parser.parse(file_path)
+    try:
+        parsed_data = parse_uploaded_file(file_path, vendor)
+    except Exception as e:
+        return f"Error parsing file: {e}"
+    parser = PARSERS.get(vendor)()
     mapping = parser.get_elasticsearch_mapping()
 
     if es_user and es_pass:
