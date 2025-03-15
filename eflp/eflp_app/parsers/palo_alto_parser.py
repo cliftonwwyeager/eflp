@@ -2,7 +2,7 @@ import re
 import csv
 from parsers.base_parser import BaseParser
 
-class PaloAltoParserOptimized(BaseParser):
+class PaloAltoParser(BaseParser):
     SYSLOG_REGEX = re.compile(r'^<(?P<priority>\d+)>\S*\s+(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<payload>.*)$')
 
     def parse(self, file_path):
