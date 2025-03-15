@@ -1,11 +1,11 @@
-# EFLP v0.0.6
+# EFLP v0.0.7
 
 A flask application that parses firewall logs by selected vendor, uses matpoltlib to create a bar graph displaying a count of parsed logs by severity, Elasticsearch integration. Application presented over ssl/tls on **port 8443** 
 
 ## Features
 
 1. **Vendor-Specific Parsing**  
-   - Six built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Cisco Meraki and Check Point.  
+   - Seven built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Cisco Meraki, CheckPoint and Unifi.  
    - Each parser extracts integer fields (ports, session IDs) and returns consistent fields (`severity`, `timestamp`, etc.).
 
 2. **Severity Chart**  
