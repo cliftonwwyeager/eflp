@@ -36,7 +36,7 @@ PARSERS = {
     "sonicwall": SonicwallParser,
     "cisco_ftd": CiscoFTDParser,
     "checkpoint": CheckpointParser,
-    "meraki": MerakiParser
+    "meraki": MerakiParser,
     "unifi": UnifiParser
 }
 
