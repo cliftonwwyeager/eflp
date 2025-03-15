@@ -1,7 +1,7 @@
 import re
 from parsers.base_parser import BaseParser
 
-class SonicwallParserOptimized(BaseParser):
+class SonicwallParser(BaseParser):
     KV_REGEX = re.compile(r'(?P<key>\w+)\s*=\s*"?(?P<value>[^"]+)"?')
 
     def parse(self, file_path):
