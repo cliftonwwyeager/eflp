@@ -16,6 +16,7 @@ from parsers.sonicwall_parser import SonicwallParser
 from parsers.cisco_ftd_parser import CiscoFTDParser
 from parsers.checkpoint_parser import CheckpointParser
 from parsers.meraki_parser import MerakiParser
+from parsers.unifi_parser import UnifiParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -36,6 +37,7 @@ PARSERS = {
     "cisco_ftd": CiscoFTDParser,
     "checkpoint": CheckpointParser,
     "meraki": MerakiParser
+    "unifi": UnifiParser
 }
 
 STYLE = """
