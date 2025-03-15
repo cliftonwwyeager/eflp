@@ -1,7 +1,7 @@
 import re
 from parsers.base_parser import BaseParser
 
-class CiscoFTDParserOptimized(BaseParser):
+class CiscoFTDParser(BaseParser):
     SYSLOG_REGEX = re.compile(
         r'^(?P<month>\w{3})\s+(?P<day>\d+)\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<payload>.*)$'
     )
