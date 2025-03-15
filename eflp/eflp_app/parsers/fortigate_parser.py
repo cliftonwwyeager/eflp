@@ -1,7 +1,7 @@
 import re
 from parsers.base_parser import BaseParser
 
-class FortigateParserOptimized(BaseParser):
+class FortigateParser(BaseParser):
     SYSLOG_REGEX = re.compile(r'^<(?P<priority>\d+)>(?P<payload>.*)$')
     KV_REGEX = re.compile(r'(?P<key>\w+)\s*=\s*"?(?P<value>[^"]+)"?')
     LEVEL_TO_SEVERITY = {
