@@ -3,7 +3,7 @@ from parsers.base_parser import BaseParser
 from dateutil import parser as date_parser
 from datetime import datetime
 
-class MerakiParserOptimized(BaseParser):
+class MerakiParser(BaseParser):
     def parse(self, file_path):
         parsed_logs = []
         with open(file_path, 'r') as f:
