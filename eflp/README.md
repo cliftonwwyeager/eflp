@@ -31,6 +31,6 @@ A Flask application that parses firewall logs by selected vendor. The app featur
 ## Docker Build and Run
 
 cd to eflp/eflp_app directory, then run 
-
+```
 docker-compose build
 docker-compose up -d
