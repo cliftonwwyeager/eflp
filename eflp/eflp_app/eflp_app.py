@@ -5,9 +5,11 @@ import base64
 import pytz
 import pandas as pd
 import plotly.express as px
-from flask import Flask, request, send_file
+from flask import Flask, request, Response, render_template_string, send_file
 from dateutil import parser as date_parser
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers
+from influxdb import InfluxDBClient
+from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 from neo4j import GraphDatabase
 from parsers.palo_alto_parser import PaloAltoParser
@@ -20,16 +22,13 @@ from parsers.unifi_parser import UnifiParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
-
 DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS = os.path.join(DIR, "uploads")
 os.makedirs(UPLOADS, exist_ok=True)
-
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "testuser")
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
 PARSERS = {
     "palo_alto": PaloAltoParser,
     "fortigate": FortigateParser,
@@ -40,20 +39,106 @@ PARSERS = {
     "unifi": UnifiParser
 }
 
-STYLE = """
-<style>
-body { background-color:black; color:#00FF00; font-family:Arial,sans-serif; margin:20px; }
-h1, h2, h3, label, table, th, td, input, select, option, form, p { color:#00FF00; }
-a { color:#00FF00; text-decoration:none; }
-a:hover { text-decoration:underline; }
-input, select { background-color:#333; border:1px solid #00FF00; color:#00FF00; margin:5px 0; padding:5px; }
-table { border-collapse:collapse; width: 100%; }
-th, td { border:1px solid #00FF00; padding:6px 8px; }
-.button { background-color:#333; color:#00FF00; border:1px solid #00FF00; padding:8px 12px; cursor:pointer; margin-top:10px; }
-.button:hover { background-color:#444; }
-.scroll-box { max-height:300px; overflow-y:auto; margin-top:20px; border:1px solid #00FF00; padding:5px; }
-.case-box { border:1px solid #00FF00; padding:5px; margin:10px 0; }
-</style>
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{{ title }}</title>
+  <meta charset="UTF-8">
+  <style>
+    body { 
+      background-color: #121212; 
+      color: #e0e0e0; 
+      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+      margin: 20px;
+    }
+    header { 
+      background-color: #1f1f1f; 
+      padding: 10px 20px; 
+      border-radius: 5px; 
+      margin-bottom: 20px;
+    }
+    header h1 { 
+      margin: 0; 
+      font-size: 24px; 
+    }
+    nav a { 
+      margin-right: 15px; 
+      color: #90caf9; 
+      text-decoration: none; 
+    }
+    nav a:hover { 
+      text-decoration: underline; 
+    }
+    .container { 
+      max-width: 1000px; 
+      margin: 0 auto; 
+    }
+    input, select {
+      background-color: #1f1f1f; 
+      border: 1px solid #90caf9; 
+      color: #e0e0e0; 
+      padding: 8px; 
+      border-radius: 3px; 
+      margin: 5px 0; 
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .button { 
+      background-color: #1f1f1f; 
+      color: #90caf9; 
+      border: 1px solid #90caf9; 
+      padding: 10px 15px; 
+      cursor: pointer; 
+      border-radius: 3px; 
+      margin-top: 10px; 
+    }
+    .button:hover { 
+      background-color: #333; 
+    }
+    table { 
+      border-collapse: collapse; 
+      width: 100%; 
+      margin-bottom: 20px; 
+    }
+    th, td { 
+      border: 1px solid #90caf9; 
+      padding: 8px 12px; 
+    }
+    th { 
+      background-color: #1f1f1f; 
+    }
+    .scroll-box { 
+      max-height: 400px; 
+      overflow-y: auto; 
+      border: 1px solid #90caf9; 
+      padding: 10px; 
+      border-radius: 3px; 
+      margin-bottom: 20px;
+    }
+    .case-box { 
+      border: 1px solid #90caf9; 
+      padding: 10px; 
+      margin: 10px 0; 
+      border-radius: 3px; 
+    }
+  </style>
+  {{ datatables|safe }}
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>{{ header }}</h1>
+      <nav>
+        <a href="/">Home</a>
+      </nav>
+    </header>
+    <main>
+      {{ content|safe }}
+    </main>
+  </div>
+</body>
+</html>
 """
 
 DATATABLES = """
@@ -67,31 +152,42 @@ DATATABLES = """
 </script>
 """
 
+def render_page(title, header, content, use_datatables=False):
+    dt = DATATABLES if use_datatables else ""
+    return render_template_string(BASE_TEMPLATE, title=title, header=header, content=content, datatables=dt)
+
 def store_case(case_id, label, vendor, path):
-    with driver.session() as s:
-        s.run("""
-        CREATE (c:Case {
-            sid:$sid,
-            label:$label,
-            vendor:$vendor,
-            path:$path,
-            created:timestamp()
-        })
-        """, sid=case_id, label=label, vendor=vendor, path=path)
+    with driver.session() as session:
+        session.run(
+            """
+            CREATE (c:Case {
+                sid: $sid,
+                label: $label,
+                vendor: $vendor,
+                path: $path,
+                created: timestamp()
+            })
+            """,
+            sid=case_id, label=label, vendor=vendor, path=path
+        )
 
 def get_all_cases():
-    with driver.session() as s:
-        res = s.run("""
-        MATCH (c:Case)
-        RETURN c.sid AS sid, c.label AS label, c.vendor AS vendor
-        ORDER BY c.created DESC
-        """)
-        return res.data()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (c:Case)
+            RETURN c.sid AS sid, c.label AS label, c.vendor AS vendor
+            ORDER BY c.created DESC
+            """
+        )
+        return result.data()
 
 def get_case_by_sid(case_id):
-    with driver.session() as s:
-        r = s.run("MATCH (c:Case {sid:$sid}) RETURN c LIMIT 1", sid=case_id).single()
-        return r["c"] if r else None
+    with driver.session() as session:
+        record = session.run(
+            "MATCH (c:Case {sid: $sid}) RETURN c LIMIT 1", sid=case_id
+        ).single()
+        return record["c"] if record else None
 
 def parse_uploaded_file(file_path, vendor):
     ext = os.path.splitext(file_path)[1].lower()
@@ -109,43 +205,131 @@ def parse_uploaded_file(file_path, vendor):
         parser = parser_cls()
         return parser.parse(file_path)
 
+def load_case_data(case_id):
+    case = get_case_by_sid(case_id)
+    if not case:
+        return None, "Case not found."
+    vendor = case["vendor"]
+    file_path = case["path"]
+    try:
+        parsed_data = parse_uploaded_file(file_path, vendor)
+    except Exception as e:
+        return None, f"Error parsing file: {e}"
+    return case, parsed_data
+
+def generate_logs_table(df, columns):
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    records = df[columns].to_dict("records")
+    head = "<tr>" + "".join(f"<th>{col.capitalize()}</th>" for col in columns) + "</tr>"
+    rows = "".join("<tr>" + "".join(f"<td>{rec[col]}</td>" for col in columns) + "</tr>" for rec in records)
+    return f"<table id='logsTable'><thead>{head}</thead><tbody>{rows}</tbody></table>"
+
+def generate_export_forms(case_id, vendor):
+    es_form = f"""
+    <form action="/export" method="post" style="margin-bottom:15px;">
+      <input type="hidden" name="case_id" value="{case_id}" />
+      <label>Elasticsearch URL:</label>
+      <input type="text" name="es_url" value="http://localhost:9200" />
+      <label>Index:</label>
+      <input type="text" name="es_index" value="{vendor}_logs" />
+      <label>ES Username:</label>
+      <input type="text" name="es_user" />
+      <label>ES Password:</label>
+      <input type="password" name="es_pass" />
+      <input class="button" type="submit" value="Export to Elasticsearch" />
+    </form>
+    """
+    influx_form = f"""
+    <form action="/export_influx" method="post" style="margin-bottom:15px;">
+      <input type="hidden" name="case_id" value="{case_id}" />
+      <label>InfluxDB URL:</label>
+      <input type="text" name="influxdb_url" value="http://localhost:8086" />
+      <label>Database:</label>
+      <input type="text" name="influxdb_db" value="{vendor}_logs" />
+      <label>InfluxDB Username:</label>
+      <input type="text" name="influxdb_user" />
+      <label>InfluxDB Password:</label>
+      <input type="password" name="influxdb_pass" />
+      <input class="button" type="submit" value="Export to InfluxDB" />
+    </form>
+    """
+    csv_form = f"""
+    <form action="/export_csv" method="post" style="margin-bottom:15px;">
+      <input type="hidden" name="case_id" value="{case_id}" />
+      <input class="button" type="submit" value="Export to CSV" />
+    </form>
+    """
+    return es_form + influx_form + csv_form
+
+def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_user, influxdb_pass):
+    parsed_url = urlparse(influxdb_url)
+    host = parsed_url.hostname if parsed_url.hostname else influxdb_url
+    port = parsed_url.port if parsed_url.port else 8086
+    client = InfluxDBClient(host=host, port=port, username=influxdb_user, password=influxdb_pass, database=influxdb_db)
+    client.create_database(influxdb_db)
+
+    points = []
+    for rec in parsed_data:
+        ts = rec.get("timestamp")
+        try:
+            dt = date_parser.parse(ts)
+            iso_time = dt.isoformat()
+        except Exception:
+            iso_time = ts
+
+        point = {
+            "measurement": "logs",
+            "tags": {
+                "vendor": vendor,
+                "severity": rec.get("severity", ""),
+                "subtype": rec.get("subtype", ""),
+                "object": rec.get("object", ""),
+            },
+            "time": iso_time,
+            "fields": {
+                "message": rec.get("message", ""),
+                "record_id": rec.get("record_id", ""),
+                "event_id": rec.get("event_id", "")
+            }
+        }
+        points.append(point)
+    client.write_points(points)
+
 @app.route("/")
 def index():
     cases = get_all_cases()
-    box = "<div class='case-box'><h3>All Cases</h3>"
+    case_box = "<div class='case-box'><h3>All Cases</h3>"
     if cases:
         for c in cases:
-            box += f"<p><a href='/case/{c['sid']}'>{c['label']} ({c['vendor']})</a></p>"
+            case_box += f"<p><a href='/case/{c['sid']}'>{c['label']} ({c['vendor']})</a></p>"
     else:
-        box += "<p>No cases found.</p>"
-    box += "</div>"
-    return f"""
-    <html>
-    <head><title>EFLP</title>{STYLE}</head>
-    <body>
-    <h1>EFLP v0.0.7</h1>
-    {box}
+        case_box += "<p>No cases found.</p>"
+    case_box += "</div>"
+
+    upload_form = """
     <h2>Upload Logs</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
-      <label>Case Label:</label><br>
-      <input type="text" name="label" placeholder="Case label" /><br><br>
-      <label>Vendor:</label><br>
+      <label>Case Label:</label>
+      <input type="text" name="label" placeholder="Case label" />
+      <label>Vendor:</label>
       <select name="vendor">
-        <option value="palo_alto">Palo Alto</option>
-        <option value="fortigate">Fortigate</option>
-        <option value="sonicwall">SonicWall</option>
-        <option value="cisco_ftd">Cisco FTD</option>
-        <option value="checkpoint">Check Point</option>
-        <option value="meraki">Meraki</option>
-        <option value="unifi">Unifi</option>
-      </select><br><br>
-      <label>Log File:</label><br>
-      <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" /><br><br>
+          <option value="palo_alto">Palo Alto</option>
+          <option value="fortigate">Fortigate</option>
+          <option value="sonicwall">SonicWall</option>
+          <option value="cisco_ftd">Cisco FTD</option>
+          <option value="checkpoint">Check Point</option>
+          <option value="meraki">Meraki</option>
+          <option value="unifi">Unifi</option>
+      </select>
+      <label>Log File:</label>
+      <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" />
       <input class="button" type="submit" value="Upload" />
     </form>
-    </body>
-    </html>
     """
+    content = case_box + upload_form
+    return render_page("EFLP", "EFLP v0.0.8", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -159,98 +343,39 @@ def upload():
     file_path = os.path.join(UPLOADS, secure_filename(uploaded_file.filename))
     uploaded_file.save(file_path)
     store_case(case_id, label, vendor, file_path)
-    return f"Case '{label}' created. <a href='/case/{case_id}'>View</a>"
+    return render_page("Case Created", "Case Created", f"Case '{label}' created. <a href='/case/{case_id}'>View</a>")
 
 @app.route("/case/<case_id>")
 def view_case(case_id):
-    c = get_case_by_sid(case_id)
-    if not c:
-        return "Case not found. <a href='/'>Back</a>"
-    vendor = c["vendor"]
-    label = c["label"]
-    file_path = c["path"]
-    try:
-        parsed_data = parse_uploaded_file(file_path, vendor)
-    except Exception as e:
-        return f"Error parsing file: {e}"
-    df = pd.DataFrame(parsed_data)
-
+    case, result = load_case_data(case_id)
+    if not case:
+        return render_page("Error", "Error", result)
+    vendor = case["vendor"]
+    label = case["label"]
+    df = pd.DataFrame(result)
     if "severity" not in df.columns:
-        h = df.head(10).to_html(index=False, border=0)
-        return f"""
-        <html>
-        <head>
-            <title>{label}</title>
-            {STYLE}
-        </head>
-        <body>
-        <h2>Case: {label} ({vendor})</h2>
-        <p>No 'severity' column found. Showing first 10 rows:</p>
-        {h}
-        <form action="/export" method="post">
-          <input type="hidden" name="case_id" value="{case_id}" />
-          <label>Elasticsearch URL:</label><br>
-          <input type="text" name="es_url" value="http://localhost:9200" /><br><br>
-          <label>Index:</label><br>
-          <input type="text" name="es_index" value="{vendor}_logs" /><br><br>
-          <label>ES Username:</label><br>
-          <input type="text" name="es_user" /><br><br>
-          <label>ES Password:</label><br>
-          <input type="password" name="es_pass" /><br><br>
-          <input class="button" type="submit" value="Export" />
-        </form>
-        <br><a href="/">Back</a>
-        </body>
-        </html>
-        """
-
-    cts = df["severity"].value_counts().sort_index()
-    fig = px.bar(x=cts.index, y=cts.values,
+        table_html = df.head(10).to_html(index=False, border=0)
+        content = f"<h2>Case: {label} ({vendor})</h2><p>No 'severity' column found. Showing first 10 rows:</p>{table_html}<br><a href='/'>Back</a>"
+        return render_page(label, f"Case: {label} ({vendor})", content)
+    severity_counts = df["severity"].value_counts().sort_index()
+    fig = px.bar(x=severity_counts.index, y=severity_counts.values,
                  labels={"x": "Severity", "y": "Count"},
                  title=f"{label} – Event Severity Distribution",
                  template="plotly_dark")
-    fig.update_traces(text=cts.values, textposition='outside')
+    fig.update_traces(text=severity_counts.values, textposition='outside')
     chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-    columns = ["timestamp", "severity", "message"]
-    for col in columns:
-        if col not in df.columns:
-            df[col] = ""
-    df_records = df[columns].to_dict("records")
-    table_head = "<tr>" + "".join(f"<th>{c.capitalize()}</th>" for c in columns) + "</tr>"
-    table_rows = []
-    for rec in df_records:
-        row = "<tr>" + "".join(f"<td>{rec[c]}</td>" for c in columns) + "</tr>"
-        table_rows.append(row)
-    table_html = f"<table id='logsTable'><thead>{table_head}</thead><tbody>{''.join(table_rows)}</tbody></table>"
-
-    return f"""
-    <html>
-    <head>
-        <title>{label}</title>
-        {STYLE}
-        {DATATABLES}
-    </head>
-    <body>
-    <h2>Case: {label} ({vendor})</h2>
-    <div>{chart_html}</div>
-    <h3>Log Records</h3>
-    <div class='scroll-box'>{table_html}</div>
-    <form action="/export" method="post">
-      <input type="hidden" name="case_id" value="{case_id}" />
-      <label>Elasticsearch URL:</label><br>
-      <input type="text" name="es_url" value="http://localhost:9200" /><br><br>
-      <label>Index:</label><br>
-      <input type="text" name="es_index" value="{vendor}_logs" /><br><br>
-      <label>ES Username:</label><br>
-      <input type="text" name="es_user" /><br><br>
-      <label>ES Password:</label><br>
-      <input type="password" name="es_pass" /><br><br>
-      <input class="button" type="submit" value="Export" />
-    </form>
-    <br><a href="/">Back</a>
-    </body>
-    </html>
+    table_html = generate_logs_table(df, ["timestamp", "severity", "message"])
+    export_forms = generate_export_forms(case_id, vendor)
+    content = f"""
+      <h2>Case: {label} ({vendor})</h2>
+      {chart_html}
+      <h3>Log Records</h3>
+      <div class="scroll-box">{table_html}</div>
+      <h3>Export Options</h3>
+      {export_forms}
+      <br><a href="/">Back</a>
     """
+    return render_page(label, f"Case: {label} ({vendor})", content, use_datatables=True)
 
 @app.route("/export", methods=["POST"])
 def export_es():
@@ -260,30 +385,51 @@ def export_es():
     es_user = request.form.get("es_user", "")
     es_pass = request.form.get("es_pass", "")
 
-    c = get_case_by_sid(case_id)
-    if not c:
-        return "Case not found. <a href='/'>Back</a>"
-    vendor = c["vendor"]
-    file_path = c["path"]
-    try:
-        parsed_data = parse_uploaded_file(file_path, vendor)
-    except Exception as e:
-        return f"Error parsing file: {e}"
-    parser = PARSERS.get(vendor)()
-    mapping = parser.get_elasticsearch_mapping()
-
+    case, parsed_data = load_case_data(case_id)
+    if not case:
+        return render_page("Error", "Error", parsed_data)
+    vendor = case["vendor"]
     if es_user and es_pass:
         es = Elasticsearch([es_url], http_auth=(es_user, es_pass))
     else:
         es = Elasticsearch([es_url])
-
+    parser_instance = PARSERS.get(vendor)()
+    mapping = parser_instance.get_elasticsearch_mapping()
     if not es.indices.exists(index=es_index):
         es.indices.create(index=es_index, body=mapping, ignore=400)
+    actions = [{"_index": es_index, "_source": rec} for rec in parsed_data]
+    helpers.bulk(es, actions)
+    return render_page("Export Success", "Elasticsearch Export", f"Logs exported to Elasticsearch index '{es_index}'. <a href='/case/{case_id}'>Back</a>")
 
-    for rec in parsed_data:
-        es.index(index=es_index, document=rec)
+@app.route("/export_influx", methods=["POST"])
+def export_influx():
+    case_id = request.form.get("case_id")
+    influxdb_url = request.form.get("influxdb_url", "http://localhost:8086")
+    influxdb_db = request.form.get("influxdb_db", "logs")
+    influxdb_user = request.form.get("influxdb_user", "")
+    influxdb_pass = request.form.get("influxdb_pass", "")
+    case, parsed_data = load_case_data(case_id)
+    if not case:
+        return render_page("Error", "Error", parsed_data)
+    vendor = case["vendor"]
+    try:
+        export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_user, influxdb_pass)
+    except Exception as e:
+        return render_page("Error", "Error", f"Error exporting to InfluxDB: {e}")
+    return render_page("Export Success", "InfluxDB Export", f"Logs exported to InfluxDB database '{influxdb_db}'. <a href='/case/{case_id}'>Back</a>")
 
-    return f"Logs exported to {es_index}. <a href='/case/{case_id}'>Back</a>"
-    
+@app.route("/export_csv", methods=["POST"])
+def export_csv():
+    case_id = request.form.get("case_id")
+    case, parsed_data = load_case_data(case_id)
+    if not case:
+        return render_page("Error", "Error", parsed_data)
+    df = pd.DataFrame(parsed_data)
+    csv_data = df.to_csv(index=False)
+    filename = f"{case['label'].replace(' ', '_')}_logs.csv"
+    return Response(csv_data,
+                    mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment;filename={filename}"})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
