@@ -9,3 +9,4 @@ pytz==2023.3
 neo4j==5.7.0
 werkzeug==2.2.2
 plotly==5.14.1
+influxdb==5.3.1
