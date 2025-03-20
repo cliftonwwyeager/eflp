@@ -16,29 +16,26 @@ class FortigateParser(BaseParser):
     }
 
     def parse(self, file_path):
-        data = []
+        records = []
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                m = self.SYSLOG_REGEX.match(line)
-                if not m:
+                match = self.SYSLOG_REGEX.match(line)
+                if not match:
                     continue
-                payload = m.group('payload')
-                kv_pairs = self.KV_REGEX.findall(payload)
-                kv_dict = {}
-                for k, v in kv_pairs:
-                    kv_dict[k.lower()] = v.strip()
+                payload = match.group('payload')
+                kv_dict = self._parse_key_values(payload)
                 level_str = kv_dict.get('level', '').lower()
                 severity = self.LEVEL_TO_SEVERITY.get(level_str, 'INFO')
-                timestamp = (kv_dict.get('date', '') + ' ' + kv_dict.get('time', '')).strip()
+                timestamp = f"{kv_dict.get('date', '').strip()} {kv_dict.get('time', '').strip()}".strip()
                 for field in ['srcport', 'dstport', 'sessionid', 'sentbyte', 'rcvdbyte', 'sentpkt', 'rcvdpkt']:
                     if field in kv_dict:
                         kv_dict[field] = self.to_int(kv_dict[field])
                 srcip = kv_dict.get('srcip', '')
                 dstip = kv_dict.get('dstip', '')
-                rec = self.build_record(
+                record = self.build_record(
                     timestamp=timestamp,
                     severity=severity,
                     srcip=srcip,
@@ -53,22 +50,17 @@ class FortigateParser(BaseParser):
                     raw_fields=kv_dict,
                     message=kv_dict.get('msg', '')
                 )
-                if rec and 'severity' in rec:
-                    rec['severity_int'] = self._severity_to_int(rec['severity'])
-                data.append(rec)
-        return data
+                record['severity_int'] = self._severity_to_int(severity)
+                records.append(record)
+        return records
+
+    def _parse_key_values(self, payload):
+        kv_pairs = self.KV_REGEX.findall(payload)
+        return {k.lower(): v.strip() for k, v in kv_pairs}
 
     def _severity_to_int(self, severity_str):
-        sev = severity_str.upper()
-        if sev == 'CRITICAL':
-            return 1
-        if sev == 'HIGH':
-            return 2
-        if sev == 'MEDIUM':
-            return 3
-        if sev == 'LOW':
-            return 4
-        return 5
+        mapping = {'CRITICAL': 1, 'HIGH': 2, 'MEDIUM': 3, 'LOW': 4, 'INFO': 5}
+        return mapping.get(severity_str.upper(), 5)
 
     def get_elasticsearch_mapping(self):
         return {
