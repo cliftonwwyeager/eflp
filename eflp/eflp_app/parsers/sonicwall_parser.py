@@ -5,37 +5,18 @@ class SonicwallParser(BaseParser):
     KV_REGEX = re.compile(r'(?P<key>\w+)\s*=\s*"?(?P<value>[^"]+)"?')
 
     def parse(self, file_path):
-        data = []
+        records = []
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                kv_pairs = self.KV_REGEX.findall(line)
-                kv_dict = {}
-                for k, v in kv_pairs:
-                    kv_dict[k.lower()] = v.strip()
+                kv_dict = self._parse_key_values(line)
                 src_port = self.to_int(kv_dict.get('sport'))
                 dst_port = self.to_int(kv_dict.get('dport'))
                 sess_id = self.to_int(kv_dict.get('sessionid'))
-                severity = 'INFO'
-                pri_val = kv_dict.get('pri')
-                if pri_val is not None:
-                    try:
-                        p = int(pri_val)
-                        if p <= 2:
-                            severity = 'CRITICAL'
-                        elif p == 3:
-                            severity = 'HIGH'
-                        elif p == 4:
-                            severity = 'MEDIUM'
-                        elif p == 5:
-                            severity = 'LOW'
-                        else:
-                            severity = 'INFO'
-                    except ValueError:
-                        severity = 'INFO'
-                rec = self.build_record(
+                severity = self._determine_severity(kv_dict.get('pri'))
+                record = self.build_record(
                     timestamp=kv_dict.get('time', ''),
                     severity=severity,
                     srcip=kv_dict.get('src', ''),
@@ -46,22 +27,36 @@ class SonicwallParser(BaseParser):
                     raw_fields=kv_dict,
                     message=kv_dict.get('msg', '')
                 )
-                if rec and 'severity' in rec:
-                    rec['severity_int'] = self._severity_to_int(rec['severity'])
-                data.append(rec)
-        return data
+                record['severity_int'] = self._severity_to_int(severity)
+                records.append(record)
+        return records
+
+    def _parse_key_values(self, line):
+        kv_pairs = self.KV_REGEX.findall(line)
+        return {k.lower(): v.strip() for k, v in kv_pairs}
+
+    def _determine_severity(self, pri_val):
+        severity = 'INFO'
+        if pri_val is not None:
+            try:
+                p = int(pri_val)
+                if p <= 2:
+                    severity = 'CRITICAL'
+                elif p == 3:
+                    severity = 'HIGH'
+                elif p == 4:
+                    severity = 'MEDIUM'
+                elif p == 5:
+                    severity = 'LOW'
+                else:
+                    severity = 'INFO'
+            except ValueError:
+                severity = 'INFO'
+        return severity
 
     def _severity_to_int(self, severity_str):
-        sev = severity_str.upper()
-        if sev == 'CRITICAL':
-            return 1
-        if sev == 'HIGH':
-            return 2
-        if sev == 'MEDIUM':
-            return 3
-        if sev == 'LOW':
-            return 4
-        return 5
+        mapping = {'CRITICAL': 1, 'HIGH': 2, 'MEDIUM': 3, 'LOW': 4, 'INFO': 5}
+        return mapping.get(severity_str.upper(), 5)
 
     def get_elasticsearch_mapping(self):
         return {
