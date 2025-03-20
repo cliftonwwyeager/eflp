@@ -3,75 +3,78 @@ import csv
 from parsers.base_parser import BaseParser
 
 class PaloAltoParser(BaseParser):
-    SYSLOG_REGEX = re.compile(r'^<(?P<priority>\d+)>\S*\s+(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<payload>.*)$')
+    SYSLOG_REGEX = re.compile(r'^<(?P<priority>\d+)>\S+\s+(?P<timestamp>\S+)\s+(?P<host>\S+)\s+(?P<payload>.*)$')
 
     def parse(self, file_path):
-        data = []
+        records = []
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                m = self.SYSLOG_REGEX.match(line)
-                if not m:
+                match = self.SYSLOG_REGEX.match(line)
+                if not match:
                     continue
-                priority = m.group('priority')
-                sys_ts = m.group('timestamp')
-                sys_host = m.group('host')
-                payload = m.group('payload')
+                priority = match.group('priority')
+                sys_ts = match.group('timestamp')
+                sys_host = match.group('host')
+                payload = match.group('payload')
                 try:
-                    reader = csv.reader([payload])
-                    fields = next(reader)
+                    fields = next(csv.reader([payload]))
                 except Exception:
                     continue
                 fields = [field.strip() for field in fields]
                 if len(fields) < 4:
                     continue
-                raw_type = fields[3].strip().upper()
-                if raw_type == 'THREAT':
-                    severity = 'HIGH'
-                elif raw_type == 'SYSTEM':
-                    severity = 'MEDIUM'
+                event_time = fields[0] if fields[0] else sys_ts
+                palo_type = fields[2].upper() if len(fields) > 2 else ""
+                action = fields[3].lower() if len(fields) > 3 else ""
+                severity = "HIGH" if action in ("deny", "drop") else "INFO"
+                if len(fields) >= 10:
+                    src_zone = fields[4]
+                    dst_zone = fields[5]
+                    src_ip = fields[6]
+                    dst_ip = fields[7]
+                    src_port = fields[8]
+                    dst_port = fields[9]
+                    message = (
+                        f"Traffic from {src_ip}:{src_port} ({src_zone}) "
+                        f"to {dst_ip}:{dst_port} ({dst_zone}) action: {fields[3]}"
+                    )
+                
                 else:
-                    severity = 'INFO'
-                event_time = fields[1].strip() if len(fields) > 1 and fields[1].strip() else sys_ts
-                message_parts = []
-                if len(fields) >= 5:
-                    message_parts.append(f"Host: {fields[4]}")
-                if len(fields) >= 7:
-                    message_parts.append(f"Extra: {fields[6]}")
-                message = " | ".join(message_parts) if message_parts else payload
-                raw_fields = {f"field_{i}": fields[i] for i in range(len(fields))}
-                rec = self.build_record(
+                    message = payload
+                raw_fields = {f"field_{i}": value for i, value in enumerate(fields)}
+                record = self.build_record(
                     timestamp=event_time,
                     severity=severity,
                     host=sys_host,
                     message=message,
                     raw_fields=raw_fields
                 )
+                
                 try:
-                    rec['syslog_priority'] = int(priority)
+                    record['syslog_priority'] = int(priority)
                 except ValueError:
-                    rec['syslog_priority'] = priority
-                rec['syslog_timestamp'] = sys_ts
-                rec['syslog_host'] = sys_host
-                rec['raw_pan_type'] = raw_type
-                if 'severity' in rec:
-                    rec['severity_int'] = self._severity_to_int(rec['severity'])
-                data.append(rec)
-        return data
+                    record['syslog_priority'] = priority
+
+                record['syslog_timestamp'] = sys_ts
+                record['syslog_host'] = sys_host
+                record['palo_type'] = palo_type
+                record['palo_action'] = action
+                record['severity_int'] = self._severity_to_int(severity)
+
+                records.append(record)
+        return records
 
     def _severity_to_int(self, severity_str):
-        sev = severity_str.upper()
-        if sev == 'CRITICAL':
-            return 1
-        if sev == 'HIGH':
-            return 2
-        if sev == 'MEDIUM':
-            return 3
-        if sev == 'LOW':
-            return 4
-        return 5
+        mapping = {
+            'CRITICAL': 1,
+            'HIGH': 2,
+            'MEDIUM': 3,
+            'LOW': 4,
+        }
+        return mapping.get(severity_str.upper(), 5)
 
     def get_elasticsearch_mapping(self):
         return {
@@ -85,7 +88,8 @@ class PaloAltoParser(BaseParser):
                     "syslog_priority": {"type": "integer"},
                     "syslog_timestamp": {"type": "keyword"},
                     "syslog_host":     {"type": "keyword"},
-                    "raw_pan_type":    {"type": "keyword"},
+                    "palo_type":       {"type": "keyword"},
+                    "palo_action":     {"type": "keyword"},
                     "raw_fields":      {"type": "object", "enabled": True}
                 }
             }
