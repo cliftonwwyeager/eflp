@@ -9,7 +9,7 @@ A Flask application that parses firewall logs by selected vendor. The app featur
    - Each parser extracts integer fields (ports, session IDs) and returns consistent fields (`severity`, `timestamp`, etc.).
 
 2. **Severity Chart**  
-   - For each case, a bar chart is generated using Plotly that displays the count of logs by severity.
+   - For each case, a bar chart is generated using Plotly that displays the count of logs by severity, and event distribution over a 24 hour period.
    - The chart is embedded directly in the case view for quick visual analysis.
 
 3. **Elasticsearch Export**  
