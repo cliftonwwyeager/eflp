@@ -19,6 +19,8 @@ from parsers.cisco_ftd_parser import CiscoFTDParser
 from parsers.checkpoint_parser import CheckpointParser
 from parsers.meraki_parser import MerakiParser
 from parsers.unifi_parser import UnifiParser
+from parsers.juniper_parser import JuniperParser
+from parsers.watchguard_parser import WatchguardParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -36,7 +38,9 @@ PARSERS = {
     "cisco_ftd": CiscoFTDParser,
     "checkpoint": CheckpointParser,
     "meraki": MerakiParser,
-    "unifi": UnifiParser
+    "unifi": UnifiParser,
+    "juniper": JuniperParser,
+    "watchguard": WatchguardParser
 }
 
 BASE_TEMPLATE = """
@@ -47,14 +51,15 @@ BASE_TEMPLATE = """
   <meta charset="UTF-8">
   <style>
     body { 
-      background-color: #121212; 
-      color: #e0e0e0; 
-      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; 
+      background-color: #000000; 
+      color: #00FF00; 
+      font-family: 'Courier New', Courier, monospace; 
       margin: 20px;
     }
     header { 
-      background-color: #1f1f1f; 
+      background-color: #000000; 
       padding: 10px 20px; 
+      border: 1px solid #00FF00; 
       border-radius: 5px; 
       margin-bottom: 20px;
     }
@@ -64,7 +69,7 @@ BASE_TEMPLATE = """
     }
     nav a { 
       margin-right: 15px; 
-      color: #90caf9; 
+      color: #00FF00; 
       text-decoration: none; 
     }
     nav a:hover { 
@@ -75,9 +80,9 @@ BASE_TEMPLATE = """
       margin: 0 auto; 
     }
     input, select {
-      background-color: #1f1f1f; 
-      border: 1px solid #90caf9; 
-      color: #e0e0e0; 
+      background-color: #000000; 
+      border: 1px solid #00FF00; 
+      color: #00FF00; 
       padding: 8px; 
       border-radius: 3px; 
       margin: 5px 0; 
@@ -85,16 +90,16 @@ BASE_TEMPLATE = """
       box-sizing: border-box;
     }
     .button { 
-      background-color: #1f1f1f; 
-      color: #90caf9; 
-      border: 1px solid #90caf9; 
+      background-color: #000000; 
+      color: #00FF00; 
+      border: 1px solid #00FF00; 
       padding: 10px 15px; 
       cursor: pointer; 
       border-radius: 3px; 
       margin-top: 10px; 
     }
     .button:hover { 
-      background-color: #333; 
+      background-color: #003300; 
     }
     table { 
       border-collapse: collapse; 
@@ -102,22 +107,22 @@ BASE_TEMPLATE = """
       margin-bottom: 20px; 
     }
     th, td { 
-      border: 1px solid #90caf9; 
+      border: 1px solid #00FF00; 
       padding: 8px 12px; 
     }
     th { 
-      background-color: #1f1f1f; 
+      background-color: #000000; 
     }
     .scroll-box { 
       max-height: 400px; 
       overflow-y: auto; 
-      border: 1px solid #90caf9; 
+      border: 1px solid #00FF00; 
       padding: 10px; 
       border-radius: 3px; 
       margin-bottom: 20px;
     }
     .case-box { 
-      border: 1px solid #90caf9; 
+      border: 1px solid #00FF00; 
       padding: 10px; 
       margin: 10px 0; 
       border-radius: 3px; 
@@ -269,7 +274,6 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
     port = parsed_url.port if parsed_url.port else 8086
     client = InfluxDBClient(host=host, port=port, username=influxdb_user, password=influxdb_pass, database=influxdb_db)
     client.create_database(influxdb_db)
-
     points = []
     for rec in parsed_data:
         ts = rec.get("timestamp")
@@ -278,7 +282,6 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
             iso_time = dt.isoformat()
         except Exception:
             iso_time = ts
-
         point = {
             "measurement": "logs",
             "tags": {
@@ -296,8 +299,8 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
         }
         points.append(point)
     client.write_points(points)
-
 @app.route("/")
+
 def index():
     cases = get_all_cases()
     case_box = "<div class='case-box'><h3>All Cases</h3>"
@@ -307,7 +310,6 @@ def index():
     else:
         case_box += "<p>No cases found.</p>"
     case_box += "</div>"
-
     upload_form = """
     <h2>Upload Logs</h2>
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -322,6 +324,8 @@ def index():
           <option value="checkpoint">Check Point</option>
           <option value="meraki">Meraki</option>
           <option value="unifi">Unifi</option>
+          <option value="juniper">Juniper</option>
+          <option value="watchguard">WatchGuard</option>
       </select>
       <label>Log File:</label>
       <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" />
@@ -329,7 +333,7 @@ def index():
     </form>
     """
     content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.0.8", content)
+    return render_page("EFLP", "EFLP v0.0.9", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -338,7 +342,6 @@ def upload():
     uploaded_file = request.files.get("logfile")
     if not uploaded_file or uploaded_file.filename == "":
         return "No file selected"
-
     case_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOADS, secure_filename(uploaded_file.filename))
     uploaded_file.save(file_path)
@@ -384,7 +387,6 @@ def export_es():
     es_index = request.form.get("es_index", "logs")
     es_user = request.form.get("es_user", "")
     es_pass = request.form.get("es_pass", "")
-
     case, parsed_data = load_case_data(case_id)
     if not case:
         return render_page("Error", "Error", parsed_data)
