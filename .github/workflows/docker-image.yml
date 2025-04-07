@@ -7,8 +7,12 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  docker-build:
+        permissions:
+          contents: read
+          pull-requests: write
+          build:
+          runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
