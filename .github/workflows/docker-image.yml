@@ -7,11 +7,10 @@ on:
     branches: [ "main" ]
 
 jobs:
-  docker-build:
+  build:
         permissions:
           contents: read
           pull-requests: write
-          build:
           runs-on: ubuntu-latest
 
     steps:
