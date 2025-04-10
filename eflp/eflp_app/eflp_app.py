@@ -21,6 +21,8 @@ from parsers.meraki_parser import MerakiParser
 from parsers.unifi_parser import UnifiParser
 from parsers.juniper_parser import JuniperParser
 from parsers.watchguard_parser import WatchguardParser
+from parsers.sophos_utm_parser import SophosUTMParser
+from parsers.sophos_xgs_parser import SophosXGSParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -40,7 +42,9 @@ PARSERS = {
     "meraki": MerakiParser,
     "unifi": UnifiParser,
     "juniper": JuniperParser,
-    "watchguard": WatchguardParser
+    "watchguard": WatchguardParser,
+    "sophos_utm": SophosUTMParser,
+    "sophos_xgs": SophosXGSParser
 }
 
 BASE_TEMPLATE = """
@@ -326,6 +330,8 @@ def index():
           <option value="unifi">Unifi</option>
           <option value="juniper">Juniper</option>
           <option value="watchguard">WatchGuard</option>
+          <option value="sophos_utm">Sophos UTM</option>
+          <option value="sophos_xgs">Sophos XGS</option>     
       </select>
       <label>Log File:</label>
       <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" />
@@ -333,7 +339,7 @@ def index():
     </form>
     """
     content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.0.9", content)
+    return render_page("EFLP", "EFLP v0.0.9-1", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
