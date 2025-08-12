@@ -1,11 +1,11 @@
-# EFLP v0.0.9-1
+# EFLP v0.1.0
 
 A Flask application that parses firewall traffic logs by selected vendor. The app features a modern, dark-themed UI and supports vendor-specific parsing, log severity visualization, and multiple export options (Elasticsearch, InfluxDB, and CSV). The application is served over SSL/TLS on port 8443.
 
 ## Features
 
 1. **Vendor-Specific Parsing**  
-   - Eleven built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Cisco Meraki, CheckPoint, Unifi, Juniper, Watchguard, Sophos UTM and XGS.  
+   - Eleven built-in parsers: Palo Alto, Fortigate, SonicWall, Cisco FTD, Cisco Meraki, CheckPoint, Unifi, Juniper, Watchguard, Sophos UTM/XGS, and Netscaler.  
    - Each parser extracts integer fields (ports, session IDs) and returns consistent fields (`severity`, `timestamp`, etc.).
 
 2. **Severity Chart**  
@@ -34,3 +34,4 @@ cd to eflp/eflp_app directory, then run
 ```
 docker-compose build
 docker-compose up -d
+
