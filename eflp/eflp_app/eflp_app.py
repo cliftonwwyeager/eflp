@@ -23,6 +23,7 @@ from parsers.juniper_parser import JuniperParser
 from parsers.watchguard_parser import WatchguardParser
 from parsers.sophos_utm_parser import SophosUTMParser
 from parsers.sophos_xgs_parser import SophosXGSParser
+from parsers.netscaler_parser import NetscalerParser  # NEW
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -44,7 +45,8 @@ PARSERS = {
     "juniper": JuniperParser,
     "watchguard": WatchguardParser,
     "sophos_utm": SophosUTMParser,
-    "sophos_xgs": SophosXGSParser
+    "sophos_xgs": SophosXGSParser,
+    "netscaler": NetscalerParser  # NEW
 }
 
 BASE_TEMPLATE = """
@@ -226,12 +228,20 @@ def load_case_data(case_id):
         return None, f"Error parsing file: {e}"
     return case, parsed_data
 
-def generate_logs_table(df, columns):
+def generate_logs_table(df, columns=None):
+    preferred = [
+        "timestamp", "severity", "event", "action", "network_type",
+        "src_ip", "src_port", "dst_ip", "dst_port", "protocol", "message"
+    ]
+    if columns is None:
+        columns = [c for c in preferred if c in df.columns]
+        if not columns:
+            columns = list(df.columns[:10])
     for col in columns:
         if col not in df.columns:
             df[col] = ""
-    records = df[columns].to_dict("records")
-    head = "<tr>" + "".join(f"<th>{col.capitalize()}</th>" for col in columns) + "</tr>"
+    records = df[columns].fillna("").astype(str).to_dict("records")
+    head = "<tr>" + "".join(f"<th>{col}</th>" for col in columns) + "</tr>"
     rows = "".join("<tr>" + "".join(f"<td>{rec[col]}</td>" for col in columns) + "</tr>" for rec in records)
     return f"<table id='logsTable'><thead>{head}</thead><tbody>{rows}</tbody></table>"
 
@@ -303,8 +313,36 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
         }
         points.append(point)
     client.write_points(points)
-@app.route("/")
 
+def ensure_network_type(df: pd.DataFrame) -> pd.DataFrame:
+    if "network_type" in df.columns:
+        return df
+    nts = []
+    for _, row in df.iterrows():
+        s = " ".join(str(x) for x in [
+            row.get("message", ""),
+            row.get("severity", ""),
+            row.get("subtype", ""),
+            row.get("object", "")
+        ]).lower()
+        t = "unknown"
+        if any(k in s for k in ["sslvpn", "nsvpn", "vpn", "citrix gateway"]):
+            t = "sslvpn"
+        elif any(k in s for k in ["ike", "ipsec"]):
+            t = "ike"
+        elif "appfw" in s or "app firewall" in s:
+            t = "appfw"
+        elif "wan" in s or "internet" in s:
+            t = "wan"
+        elif "lan" in s or "intranet" in s:
+            t = "lan"
+        elif "dmz" in s:
+            t = "dmz"
+        nts.append(t)
+    df["network_type"] = nts
+    return df
+
+@app.route("/")
 def index():
     cases = get_all_cases()
     case_box = "<div class='case-box'><h3>All Cases</h3>"
@@ -331,7 +369,8 @@ def index():
           <option value="juniper">Juniper</option>
           <option value="watchguard">WatchGuard</option>
           <option value="sophos_utm">Sophos UTM</option>
-          <option value="sophos_xgs">Sophos XGS</option>     
+          <option value="sophos_xgs">Sophos XGS</option>
+          <option value="netscaler">Netscaler (Citrix ADC)</option>     
       </select>
       <label>Log File:</label>
       <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" />
@@ -339,7 +378,7 @@ def index():
     </form>
     """
     content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.0.9-1", content)
+    return render_page("EFLP", "EFLP v0.0.9-2", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -362,22 +401,90 @@ def view_case(case_id):
     vendor = case["vendor"]
     label = case["label"]
     df = pd.DataFrame(result)
+
+    if df.empty:
+        return render_page(label, f"Case: {label} ({vendor})",
+                           f"<h2>Case: {label} ({vendor})</h2><p>No records parsed.</p><br><a href='/'>Back</a>")
+
     if "severity" not in df.columns:
         table_html = df.head(10).to_html(index=False, border=0)
         content = f"<h2>Case: {label} ({vendor})</h2><p>No 'severity' column found. Showing first 10 rows:</p>{table_html}<br><a href='/'>Back</a>"
         return render_page(label, f"Case: {label} ({vendor})", content)
-    severity_counts = df["severity"].value_counts().sort_index()
-    fig = px.bar(x=severity_counts.index, y=severity_counts.values,
-                 labels={"x": "Severity", "y": "Count"},
-                 title=f"{label} – Event Severity Distribution",
-                 template="plotly_dark")
-    fig.update_traces(text=severity_counts.values, textposition='outside')
-    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-    table_html = generate_logs_table(df, ["timestamp", "severity", "message"])
+
+    for c in ["event", "message", "src_ip"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = ensure_network_type(df)
+
+    severity_counts = df["severity"].fillna("").astype(str).value_counts().sort_index()
+    fig_sev = px.bar(
+        x=severity_counts.index, y=severity_counts.values,
+        labels={"x": "Severity", "y": "Count"},
+        title=f"{label} – Event Severity Distribution",
+        template="plotly_dark"
+    )
+    fig_sev.update_traces(text=severity_counts.values, textposition='outside')
+    chart_sev = fig_sev.to_html(full_html=False, include_plotlyjs='cdn')
+
+    event_series = df["event"]
+    if event_series.fillna("").eq("").all() and "subtype" in df.columns:
+        event_series = df["subtype"].astype(str)
+    if event_series.fillna("").eq("").all():
+        event_series = df["message"].astype(str).str.extract(r'\\b(APPFW_[A-Z0-9_]+)\\b', expand=False).fillna("misc")
+
+    event_counts = event_series.value_counts()
+    top10 = event_counts.head(10)
+    other = event_counts.iloc[10:].sum()
+    pie_df = top10.reset_index()
+    pie_df.columns = ["event", "count"]
+    if other:
+        pie_df.loc[len(pie_df)] = ["Other", int(other)]
+
+    fig_events = px.pie(
+        pie_df, names="event", values="count",
+        title=f"{label} – Most Common Security Events",
+        template="plotly_dark", hole=0.3
+    )
+    chart_events = fig_events.to_html(full_html=False, include_plotlyjs=False)
+
+    ip_field_candidates = ["src_ip", "client_ip", "source", "src"]
+    ip_field = next((f for f in ip_field_candidates if f in df.columns and not df[f].isna().all()), None)
+    if not ip_field:
+        df["ip_for_count"] = df["message"].astype(str).str.extract(r'((?:\\d{1,3}\\.){3}\\d{1,3})', expand=False)
+        ip_field = "ip_for_count"
+
+    ip_counts = df[ip_field].dropna().astype(str)
+    ip_counts = ip_counts[ip_counts.str.len() > 0].value_counts().head(20)
+    fig_ip = px.bar(
+        x=ip_counts.index, y=ip_counts.values,
+        labels={"x": "IP Address", "y": "Hits"},
+        title=f"{label} – Top {min(20, len(ip_counts))} IPs by Hits",
+        template="plotly_dark"
+    )
+    fig_ip.update_layout(xaxis={'tickangle': -45})
+    fig_ip.update_traces(text=ip_counts.values, textposition='outside')
+    chart_ip = fig_ip.to_html(full_html=False, include_plotlyjs=False)
+
+    nt_counts = df["network_type"].fillna("unknown").astype(str).value_counts()
+    fig_nt = px.bar(
+        x=nt_counts.index, y=nt_counts.values,
+        labels={"x": "Network Type", "y": "Count"},
+        title=f"{label} – Distribution by Network Type",
+        template="plotly_dark"
+    )
+   
+    fig_nt.update_traces(text=nt_counts.values, textposition='outside')
+    chart_nt = fig_nt.to_html(full_html=False, include_plotlyjs=False)
+    table_html = generate_logs_table(df)
     export_forms = generate_export_forms(case_id, vendor)
+
     content = f"""
       <h2>Case: {label} ({vendor})</h2>
-      {chart_html}
+      {chart_sev}
+      {chart_events}
+      {chart_ip}
+      {chart_nt}
       <h3>Log Records</h3>
       <div class="scroll-box">{table_html}</div>
       <h3>Export Options</h3>
