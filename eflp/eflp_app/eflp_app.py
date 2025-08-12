@@ -23,7 +23,7 @@ from parsers.juniper_parser import JuniperParser
 from parsers.watchguard_parser import WatchguardParser
 from parsers.sophos_utm_parser import SophosUTMParser
 from parsers.sophos_xgs_parser import SophosXGSParser
-from parsers.netscaler_parser import NetscalerParser  # NEW
+from parsers.netscaler_parser import NetscalerParser
 
 app = Flask(__name__)
 app.secret_key = "REPLACE_ME"
@@ -548,3 +548,4 @@ def export_csv():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
