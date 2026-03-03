@@ -1,4 +1,4 @@
-# EFLP v0.1.0
+# EFLP v0.1.1
 
 A Flask application that parses firewall traffic logs by selected vendor. The app features a modern, dark-themed UI and supports vendor-specific parsing, log severity visualization, and multiple export options (Elasticsearch, InfluxDB, and CSV). The application is served over SSL/TLS on port 8443.
 
@@ -34,4 +34,5 @@ cd to eflp/eflp_app directory, then run
 ```
 docker-compose build
 docker-compose up -d
+
 
