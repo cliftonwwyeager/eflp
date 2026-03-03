@@ -1,185 +1,111 @@
 import re
-import uuid
-from datetime import datetime
-from dateutil import parser as date_parser
+from parsers.base_parser import BaseParser
 
-_IP = r'(?:\d{1,3}\.){3}\d{1,3}'
-_IP_PORT = rf'(?P<ip>{_IP})(?::(?P<port>\d+))?'
 
-_SYSLOG_RE = re.compile(
-    r'^(?P<ts>[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<tag>[\w\-/\[\]\.:]+)\s*:\s*(?P<msg>.*)$'
-)
-
-_KV_RE = re.compile(r'(?P<key>[A-Za-z_][A-Za-z0-9_\-]*)=(?P<val>"[^"]*"|\S+)')
-_FROM_IP_RE = re.compile(r'\bfrom\s+(?P<ip>' + _IP + r')\b', re.IGNORECASE)
-_TO_IP_RE   = re.compile(r'\bto\s+(?P<ip>' + _IP + r')\b', re.IGNORECASE)
-_ARROW_IPS  = re.compile(r'(?P<src>' + _IP + r')\s*->\s*(?P<dst>' + _IP + r')')
-_ALLOW_WORDS = re.compile(r'\b(allow|accept|permit)\b', re.IGNORECASE)
-_DENY_WORDS  = re.compile(r'\b(deny|blocked?|drop(ped)?)\b', re.IGNORECASE)
-_AUTH_OK     = re.compile(r'\b(auth|login)\s+(success|ok)\b', re.IGNORECASE)
-_AUTH_FAIL   = re.compile(r'\b(auth|login)\s+(fail|den(y|ied))\b', re.IGNORECASE)
-
-def _clean(val: str) -> str:
-    if isinstance(val, str) and len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        return val[1:-1]
-    return val
-
-def _infer_network_type(tag: str, msg: str) -> str:
-    s = f"{tag or ''} {msg or ''}".lower()
-    if 'sslvpn' in s or 'nsvpn' in s or 'vpn' in s or 'citrix gateway' in s:
-        return 'sslvpn'
-    if 'ike' in s or 'ipsec' in s:
-        return 'ike'
-    if 'appfw' in s or 'app firewall' in s:
-        return 'appfw'
-    if 'wan' in s or 'internet' in s:
-        return 'wan'
-    if 'lan' in s or 'intranet' in s:
-        return 'lan'
-    if 'dmz' in s:
-        return 'dmz'
-    return 'unknown'
-
-def _infer_action(msg: str) -> str:
-    if not msg:
-        return ''
-    if _ALLOW_WORDS.search(msg):
-        return 'allow'
-    if _DENY_WORDS.search(msg):
-        return 'deny'
-    if _AUTH_OK.search(msg):
-        return 'auth_success'
-    if _AUTH_FAIL.search(msg):
-        return 'auth_fail'
-    return ''
-
-def _extract_ips_ports(msg: str, kv: dict) -> tuple[str, str, str, str]:
-    src_ip = kv.get('src') or kv.get('srcip') or kv.get('clientip') or kv.get('client_ip') or kv.get('sip') or ''
-    dst_ip = kv.get('dst') or kv.get('dstip') or kv.get('dip') or kv.get('serverip') or ''
-    src_port = kv.get('sport') or kv.get('spt') or ''
-    dst_port = kv.get('dport') or kv.get('dpt') or ''
-    if not src_ip:
-        m = re.search(_IP_PORT, msg)
-        if m:
-            src_ip = m.group('ip') or ''
-            if not src_port and m.group('port'):
-                src_port = m.group('port')
-    if (not src_ip or not dst_ip) and msg:
-        m = _ARROW_IPS.search(msg)
-        if m:
-            src_ip = src_ip or m.group('src')
-            dst_ip = dst_ip or m.group('dst')
-    if not src_ip and msg:
-        m = _FROM_IP_RE.search(msg)
-        if m:
-            src_ip = m.group('ip')
-    if not dst_ip and msg:
-        m = _TO_IP_RE.search(msg)
-        if m:
-            dst_ip = m.group('ip')
-    return src_ip, dst_ip, src_port, dst_port
-
-def _extract_event(tag: str, msg: str, kv: dict) -> str:
-    for k in ('event', 'eventname', 'signature', 'sig', 'attack', 'policyname', 'policy', 'profile'):
-        if kv.get(k):
-            return _clean(str(kv.get(k)))
-    m = re.search(r'\b(APPFW_[A-Z_0-9]+)\b', msg or '')
-    if m:
-        return m.group(1)
-    if tag:
-        return tag
-    if msg:
-        return ' '.join(msg.split()[:5])
-    return 'unknown'
-
-class NetscalerParser:
+class NetscalerParser(BaseParser):
     VENDOR = "netscaler"
+    SYSLOG_RE = re.compile(
+        r'^(?P<ts>[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<tag>[\w\-/\[\]\.:]+)\s*:\s*(?P<msg>.*)$'
+    )
+    ARROW_IP_RE = re.compile(r'(?P<src>(?:\d{1,3}\.){3}\d{1,3})\s*->\s*(?P<dst>(?:\d{1,3}\.){3}\d{1,3})')
 
-    def parse(self, file_path: str):
-        out = []
-        with open(file_path, 'r', errors='ignore') as fh:
+    TAG_CATEGORY = {
+        "APPFW": "threat",
+        "NSVPN": "vpn",
+        "SSLVPN": "vpn",
+        "AAA": "authentication",
+        "AUTH": "authentication",
+        "SYSTEM": "system",
+        "HA": "ha",
+        "CLUSTER": "ha",
+        "CONFIG": "configuration",
+        "CMD": "configuration",
+    }
+
+    def parse(self, file_path):
+        records = []
+        with open(file_path, "r", errors="ignore") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                ts = ''
-                severity = ''
-                host = ''
-                tag = ''
+
+                tag = ""
+                host = ""
                 msg = line
-                m = _SYSLOG_RE.match(line)
-                if m:
-                    ts = m.group('ts') or ''
-                    host = m.group('host') or ''
-                    tag = (m.group('tag') or '').strip()
-                    msg = (m.group('msg') or '').strip()
-                    
-                kv = {k.lower(): _clean(v) for k, v in _KV_RE.findall(line)}
-                iso_ts = ''
-                for candidate in (ts, kv.get('time'), kv.get('timestamp'), kv.get('date'), line):
-                    if not candidate:
-                        continue
-                    try:
-                        iso_ts = date_parser.parse(candidate, fuzzy=True).isoformat()
-                        break
-                    except Exception:
-                        continue
-                severity = kv.get('severity', kv.get('level', kv.get('pri', ''))).lower() if kv else ''
-                if not severity and tag:
-                    if '.' in tag:
-                        severity = tag.split('.')[-1].lower()
-                src_ip, dst_ip, src_port, dst_port = _extract_ips_ports(line, kv)
-                protocol = kv.get('proto') or kv.get('protocol') or ''
-                action = _infer_action(line)
-                event = _extract_event(tag, msg, kv)
-                network_type = _infer_network_type(tag, msg)
+                ts = ""
+
+                tagged = self.SYSLOG_RE.match(line)
+                if tagged:
+                    ts = tagged.group("ts") or ""
+                    host = tagged.group("host") or ""
+                    tag = (tagged.group("tag") or "").strip()
+                    msg = (tagged.group("msg") or "").strip()
+
+                meta = self.parse_syslog_prefix(line)
+                payload = meta.get("payload", msg) if meta else msg
+
+                raw_fields = self.parse_kv_pairs(payload)
+                raw_fields.update(self.parse_json_line(payload))
+
+                src_ip, dst_ip = self._extract_arrow_ips(payload)
+                action = self.normalize_action(
+                    self.first_value(raw_fields.get("action"), raw_fields.get("result"), raw_fields.get("status")),
+                    payload,
+                )
+                severity = self.normalize_severity(
+                    self.first_value(raw_fields.get("severity"), raw_fields.get("level"), raw_fields.get("pri"), meta.get("priority") if meta else ""),
+                    fallback="INFO",
+                )
+                if severity == "INFO" and action in {"deny", "reset", "quarantine"}:
+                    severity = "HIGH"
+
+                category = self._category_from_tag(tag, payload)
+
                 record = {
-                    "timestamp": iso_ts or '',
-                    "severity": severity or '',
-                    "message": msg,
-                    "src_ip": src_ip,
-                    "dst_ip": dst_ip,
-                    "src_port": src_port,
-                    "dst_port": dst_port,
-                    "protocol": protocol,
+                    "timestamp": self.first_value(
+                        raw_fields.get("timestamp"),
+                        raw_fields.get("time"),
+                        ts,
+                        meta.get("timestamp") if meta else "",
+                    ),
+                    "severity": severity,
+                    "host": self.first_value(host, meta.get("host") if meta else "", raw_fields.get("hostname")),
+                    "message": payload,
+                    "event": self.first_value(raw_fields.get("event"), raw_fields.get("eventname"), raw_fields.get("signature"), tag),
                     "action": action,
-                    "event": event,
-                    "network_type": network_type,
-                    "subtype": kv.get('subtype', ''),
-                    "object": kv.get('policy') or kv.get('policyname') or kv.get('profile') or '',
-                    "host": host,
-                    "vendor": self.VENDOR,
-                    "record_id": str(uuid.uuid4()),
-                    "event_id": kv.get('eventid', kv.get('id', ''))
+                    "log_category": category,
+                    "src_ip": self.first_value(raw_fields.get("src"), raw_fields.get("srcip"), raw_fields.get("clientip"), src_ip),
+                    "dst_ip": self.first_value(raw_fields.get("dst"), raw_fields.get("dstip"), raw_fields.get("serverip"), dst_ip),
+                    "src_port": self.first_value(raw_fields.get("sport"), raw_fields.get("srcport")),
+                    "dst_port": self.first_value(raw_fields.get("dport"), raw_fields.get("dstport")),
+                    "protocol": self.first_value(raw_fields.get("proto"), raw_fields.get("protocol")),
+                    "rule": self.first_value(raw_fields.get("policy"), raw_fields.get("policyname"), raw_fields.get("profile")),
+                    "signature": self.first_value(raw_fields.get("signature"), raw_fields.get("attack"), raw_fields.get("threat")),
+                    "event_id": self.first_value(raw_fields.get("eventid"), raw_fields.get("id"), raw_fields.get("msgid")),
+                    "session_id": self.first_value(raw_fields.get("sessionid"), raw_fields.get("sid"), raw_fields.get("connid")),
+                    "user": self.first_value(raw_fields.get("user"), raw_fields.get("username"), raw_fields.get("aaauser")),
+                    "raw_fields": raw_fields,
+                    "syslog_priority": meta.get("priority") if meta else None,
                 }
-                out.append(record)
-        return out
+
+                record = self.enrich_record(record, vendor=self.VENDOR, default_category=category)
+                records.append(record)
+
+        return records
+
+    def _extract_arrow_ips(self, payload):
+        match = self.ARROW_IP_RE.search(payload)
+        if not match:
+            return "", ""
+        return match.group("src") or "", match.group("dst") or ""
+
+    def _category_from_tag(self, tag, payload):
+        haystack = f"{tag or ''} {payload or ''}".upper()
+        for hint, category in self.TAG_CATEGORY.items():
+            if hint in haystack:
+                return category
+        return "unknown"
 
     def get_elasticsearch_mapping(self):
-        return {
-            "settings": {
-                "number_of_shards": 1,
-                "number_of_replicas": 0
-            },
-            "mappings": {
-                "properties": {
-                    "timestamp": {"type": "date"},
-                    "severity":  {"type": "keyword"},
-                    "message":   {"type": "text"},
-                    "src_ip":    {"type": "ip"},
-                    "dst_ip":    {"type": "ip"},
-                    "src_port":  {"type": "integer"},
-                    "dst_port":  {"type": "integer"},
-                    "protocol":  {"type": "keyword"},
-                    "action":    {"type": "keyword"},
-                    "event":     {"type": "keyword"},
-                    "network_type": {"type": "keyword"},
-                    "subtype":   {"type": "keyword"},
-                    "object":    {"type": "keyword"},
-                    "host":      {"type": "keyword"},
-                    "vendor":    {"type": "keyword"},
-                    "record_id": {"type": "keyword"},
-                    "event_id":  {"type": "keyword"}
-                }
-            }
-        }
+        return self.get_base_elasticsearch_mapping()

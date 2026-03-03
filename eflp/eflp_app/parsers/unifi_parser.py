@@ -1,113 +1,89 @@
 import re
 from parsers.base_parser import BaseParser
 
+
 class UnifiParser(BaseParser):
-    SYSLOG_REGEX = re.compile(r'^<(?P<priority>\d+)>(?P<month>\w{3})\s+(?P<day>\d+)\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>\S+):\s+(?P<payload>.*)$')
-    KV_REGEX = re.compile(r'(?P<key>\w+)=("?(?P<value>[^"\s]+)"?)')
+    BRACKET_PREFIX = re.compile(r'^\[[^\]]+\]\s*')
 
     def parse(self, file_path):
         records = []
-        with open(file_path, 'r') as f:
-            for line in f:
+        with open(file_path, "r", errors="ignore") as fh:
+            for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                syslog_match = self.SYSLOG_REGEX.match(line)
-                if not syslog_match:
-                    continue
-                parsed_line = self._parse_syslog_match(syslog_match)
-                record = self.build_record(
-                    timestamp=parsed_line['timestamp'],
-                    severity=parsed_line['severity'],
-                    host=parsed_line['host'],
-                    srcip=parsed_line.get('srcip', ''),
-                    dstip=parsed_line.get('dstip', ''),
-                    protocol=parsed_line.get('protocol', ''),
-                    srcport=parsed_line.get('srcport'),
-                    dstport=parsed_line.get('dstport'),
-                    message=line,
-                    raw_fields=parsed_line['raw_fields']
+
+                meta = self.parse_syslog_prefix(line)
+                payload = meta.get("payload", "") if meta else line
+                payload = self._strip_prefix(payload)
+
+                raw_fields = self.parse_kv_pairs(payload)
+                action = self.normalize_action(
+                    self.first_value(raw_fields.get("action"), raw_fields.get("result"), raw_fields.get("decision")),
+                    payload,
                 )
-                record['severity_int'] = self._severity_to_int(parsed_line['severity'])
+
+                severity = self.normalize_severity(
+                    self.first_value(raw_fields.get("severity"), raw_fields.get("priority"), meta.get("priority") if meta else ""),
+                    fallback="INFO",
+                )
+                if severity == "INFO" and action in {"deny", "reset", "quarantine"}:
+                    severity = "HIGH"
+
+                event = self.first_value(
+                    raw_fields.get("event"),
+                    raw_fields.get("event_type"),
+                    raw_fields.get("subsystem"),
+                    raw_fields.get("rule"),
+                )
+
+                category = "unknown"
+                if "ids" in payload.lower() or "ips" in payload.lower():
+                    category = "threat"
+                elif "wireguard" in payload.lower() or "openvpn" in payload.lower() or "ipsec" in payload.lower():
+                    category = "vpn"
+                elif "radius" in payload.lower() or "login" in payload.lower() or "auth" in payload.lower():
+                    category = "authentication"
+                elif "firewall" in payload.lower() or "flow" in payload.lower():
+                    category = "traffic"
+                elif "system" in payload.lower() or "ubios" in payload.lower():
+                    category = "system"
+
+                record = {
+                    "timestamp": self.first_value(raw_fields.get("timestamp"), meta.get("timestamp") if meta else ""),
+                    "severity": severity,
+                    "host": self.first_value(meta.get("host") if meta else "", raw_fields.get("hostname"), raw_fields.get("device")),
+                    "message": payload,
+                    "event": event,
+                    "action": action,
+                    "log_category": category,
+                    "src_ip": self.first_value(raw_fields.get("src"), raw_fields.get("srcip"), raw_fields.get("source")),
+                    "dst_ip": self.first_value(raw_fields.get("dst"), raw_fields.get("dstip"), raw_fields.get("destination")),
+                    "src_port": self.first_value(raw_fields.get("spt"), raw_fields.get("srcport"), raw_fields.get("sport")),
+                    "dst_port": self.first_value(raw_fields.get("dpt"), raw_fields.get("dstport"), raw_fields.get("dport")),
+                    "protocol": self.first_value(raw_fields.get("proto"), raw_fields.get("protocol")),
+                    "rule": self.first_value(raw_fields.get("rule"), raw_fields.get("policy")),
+                    "signature": self.first_value(raw_fields.get("signature"), raw_fields.get("threat")),
+                    "event_id": self.first_value(raw_fields.get("eventid"), raw_fields.get("msgid")),
+                    "session_id": self.first_value(raw_fields.get("sessionid"), raw_fields.get("flowid")),
+                    "user": self.first_value(raw_fields.get("user"), raw_fields.get("username"), raw_fields.get("mac")),
+                    "raw_fields": raw_fields,
+                    "syslog_priority": meta.get("priority") if meta else None,
+                }
+
+                record = self.enrich_record(record, vendor="unifi", default_category=category)
                 records.append(record)
+
         return records
 
-    def _parse_syslog_match(self, match):
-        priority = match.group('priority')
-        month = match.group('month')
-        day = match.group('day')
-        time_str = match.group('time')
-        host = match.group('host')
-        payload = match.group('payload')
-        timestamp = f"{month} {day} {time_str}"
-        payload = self._strip_prefix(payload)
-        raw_fields = self._parse_kv_pairs(payload)
-        severity = self._calculate_severity(priority)
-        srcip = raw_fields.get('src', '')
-        dstip = raw_fields.get('dst', '')
-        protocol = raw_fields.get('protocol', '')
-        srcport = self.to_int(raw_fields.get('spt') or raw_fields.get('srcport'))
-        dstport = self.to_int(raw_fields.get('dpt') or raw_fields.get('dstport'))
-        return {
-            'timestamp': timestamp,
-            'severity': severity,
-            'host': host,
-            'raw_fields': raw_fields,
-            'srcip': srcip,
-            'dstip': dstip,
-            'protocol': protocol,
-            'srcport': srcport,
-            'dstport': dstport,
-        }
-
-    def _parse_kv_pairs(self, payload):
-        kv_dict = {}
-        for match in self.KV_REGEX.findall(payload):
-            key = match[0].lower()
-            value = match[2].strip().strip('[]')
-            kv_dict[key] = value
-        return kv_dict
-
-    def _calculate_severity(self, priority_str):
-        try:
-            prio_int = int(priority_str)
-            sev_code = prio_int % 8
-            if sev_code <= 2:
-                return 'CRITICAL'
-            elif sev_code == 3:
-                return 'HIGH'
-            elif sev_code == 4:
-                return 'MEDIUM'
-            elif sev_code == 5:
-                return 'LOW'
-            else:
-                return 'INFO'
-        except ValueError:
-            return 'INFO'
-
     def _strip_prefix(self, payload):
-        if payload.startswith('[') and ']' in payload:
-            end = payload.find(']') + 1
-            payload = payload[end:].strip()
-        if payload.lower().startswith("firewall:"):
-            payload = payload[len("firewall:"):].strip()
-        return payload
+        text = payload.strip()
+        text = self.BRACKET_PREFIX.sub("", text)
+        if text.lower().startswith("firewall:"):
+            text = text[len("firewall:"):].strip()
+        if text.lower().startswith("kernel:"):
+            text = text[len("kernel:"):].strip()
+        return text
 
     def get_elasticsearch_mapping(self):
-        return {
-            "mappings": {
-                "properties": {
-                    "timestamp":    {"type": "date"},
-                    "severity":     {"type": "keyword"},
-                    "severity_int": {"type": "integer"},
-                    "host":         {"type": "keyword"},
-                    "srcip":        {"type": "ip"},
-                    "dstip":        {"type": "ip"},
-                    "protocol":     {"type": "keyword"},
-                    "srcport":      {"type": "integer"},
-                    "dstport":      {"type": "integer"},
-                    "message":      {"type": "text"},
-                    "raw_fields":   {"type": "object", "enabled": True}
-                }
-            }
-        }
+        return self.get_base_elasticsearch_mapping()
