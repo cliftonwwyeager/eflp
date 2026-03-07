@@ -1,4 +1,4 @@
-# EFLP v0.1.1
+# EFLP v0.1.2
 
 Flask-based forensic analysis application that ingests multi-vendor firewall logs, normalizes records into a common schema, and provides a case-centric investigation UI with charts, searchable tables, and export pipelines.
 
@@ -109,3 +109,4 @@ Upload accepts:
 - `.tsv`
 
 CSV/TSV inputs are read directly into records; other formats are parsed by vendor-specific parsers.
+
