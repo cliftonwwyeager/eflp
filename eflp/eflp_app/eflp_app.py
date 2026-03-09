@@ -57,6 +57,7 @@ CASE_PARSE_STATUS = {}
 CASE_DATA_CACHE = {}
 CASE_STATE_LOCK = threading.Lock()
 PLOTLY_DIV_ID_RE = re.compile(r'<div id="([^"]+)" class="plotly-graph-div"')
+CASE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SEVERITY_SORT = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
 UNKNOWN_VALUE_TOKENS = {
     "",
@@ -586,7 +587,21 @@ def render_page(title, header, content, use_datatables=False):
     return render_template_string(BASE_TEMPLATE, title=title, header=header, content=content, datatables=dt)
 
 
+def resolve_case_sidecar_path(case_id, sidecar_name):
+    safe_case_id = str(case_id or "").strip()
+    if not CASE_ID_RE.fullmatch(safe_case_id):
+        return None, None
+    uploads_root = os.path.abspath(UPLOADS)
+    sidecar_path = os.path.abspath(os.path.join(uploads_root, f"{safe_case_id}.{sidecar_name}.json"))
+    if os.path.commonpath([uploads_root, sidecar_path]) != uploads_root:
+        return None, None
+    return safe_case_id, sidecar_path
+
+
 def set_case_parse_status(case_id, status, message="", records=0):
+    safe_case_id, status_path = resolve_case_sidecar_path(case_id, "status")
+    if not safe_case_id:
+        return
     state = {
         "status": status,
         "message": message,
@@ -594,8 +609,7 @@ def set_case_parse_status(case_id, status, message="", records=0):
         "updated": time.time(),
     }
     with CASE_STATE_LOCK:
-        CASE_PARSE_STATUS[case_id] = state
-    status_path = os.path.join(UPLOADS, f"{case_id}.status.json")
+        CASE_PARSE_STATUS[safe_case_id] = state
     try:
         with open(status_path, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
@@ -604,18 +618,20 @@ def set_case_parse_status(case_id, status, message="", records=0):
 
 
 def get_case_parse_status(case_id):
+    safe_case_id, status_path = resolve_case_sidecar_path(case_id, "status")
+    if not safe_case_id:
+        return None
     with CASE_STATE_LOCK:
-        state = CASE_PARSE_STATUS.get(case_id)
+        state = CASE_PARSE_STATUS.get(safe_case_id)
     if state:
         return dict(state)
-    status_path = os.path.join(UPLOADS, f"{case_id}.status.json")
     if os.path.exists(status_path):
         try:
             with open(status_path, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
             if isinstance(loaded, dict):
                 with CASE_STATE_LOCK:
-                    CASE_PARSE_STATUS[case_id] = loaded
+                    CASE_PARSE_STATUS[safe_case_id] = loaded
                 return loaded
         except Exception:
             return None
@@ -623,9 +639,11 @@ def get_case_parse_status(case_id):
 
 
 def set_cached_case_data(case_id, parsed_data):
+    safe_case_id, cache_path = resolve_case_sidecar_path(case_id, "parsed")
+    if not safe_case_id:
+        return
     with CASE_STATE_LOCK:
-        CASE_DATA_CACHE[case_id] = parsed_data
-    cache_path = os.path.join(UPLOADS, f"{case_id}.parsed.json")
+        CASE_DATA_CACHE[safe_case_id] = parsed_data
     try:
         with open(cache_path, "w", encoding="utf-8") as fh:
             json.dump(parsed_data, fh, default=str)
@@ -634,17 +652,19 @@ def set_cached_case_data(case_id, parsed_data):
 
 
 def get_cached_case_data(case_id):
+    safe_case_id, cache_path = resolve_case_sidecar_path(case_id, "parsed")
+    if not safe_case_id:
+        return None
     with CASE_STATE_LOCK:
-        cached = CASE_DATA_CACHE.get(case_id)
+        cached = CASE_DATA_CACHE.get(safe_case_id)
     if cached is not None:
         return cached
-    cache_path = os.path.join(UPLOADS, f"{case_id}.parsed.json")
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
             with CASE_STATE_LOCK:
-                CASE_DATA_CACHE[case_id] = loaded
+                CASE_DATA_CACHE[safe_case_id] = loaded
             return loaded
         except Exception:
             return None
