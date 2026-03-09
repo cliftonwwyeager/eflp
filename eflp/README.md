@@ -107,7 +107,9 @@ Upload accepts:
 - `.txt`
 - `.csv`
 - `.tsv`
+- `.tgz`
 
 CSV/TSV inputs are read directly into records; other formats are parsed by vendor-specific parsers.
+
 
 
