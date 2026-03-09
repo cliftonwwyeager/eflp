@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dateutil import parser as date_parser
+from datetime import datetime, timedelta
 import ipaddress
 import json
 import logging
@@ -25,6 +26,7 @@ class BaseParser(ABC):
         ),
     ]
     IPV4_REGEX = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    DATE_WITH_YEAR_REGEX = re.compile(r'\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b')
 
     SEVERITY_ALIASES = {
         "EMERG": "CRITICAL",
@@ -140,10 +142,36 @@ class BaseParser(ABC):
 
     def to_iso(self, date_str, default=None):
         try:
-            return date_parser.parse(str(date_str)).isoformat()
+            raw = str(date_str).strip()
+            parsed = date_parser.parse(raw)
+            if not self._timestamp_has_explicit_year(raw):
+                now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+                future_threshold = now + timedelta(days=2)
+                # Syslog timestamps often omit year; if parsing lands in the future,
+                # roll back to the most recent plausible year.
+                for _ in range(3):
+                    if parsed <= future_threshold:
+                        break
+                    parsed = self._roll_back_one_year(parsed)
+            return parsed.isoformat()
         except Exception as e:
             logger.debug(f"to_iso conversion failed for date_str '{date_str}': {e}")
             return default
+
+    def _timestamp_has_explicit_year(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if re.search(r'(?<!\d)\d{4}(?!\d)', text):
+            return True
+        return bool(self.DATE_WITH_YEAR_REGEX.search(text))
+
+    def _roll_back_one_year(self, dt):
+        try:
+            return dt.replace(year=dt.year - 1)
+        except ValueError:
+            # Handle leap day fallback for non-leap target years.
+            return dt.replace(year=dt.year - 1, month=2, day=28)
 
     def normalize_timestamp(self, *candidates):
         for candidate in candidates:
