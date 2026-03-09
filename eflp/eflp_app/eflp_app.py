@@ -1580,7 +1580,7 @@ def index():
     </div>
     """
     content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.1.1", content)
+    return render_page("EFLP", "EFLP v0.1.3", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -2041,3 +2041,4 @@ def export_json():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
+
