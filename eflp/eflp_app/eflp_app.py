@@ -5,6 +5,10 @@ import base64
 import html
 import json
 import re
+import ipaddress
+import shutil
+import tarfile
+import tempfile
 import threading
 import time
 import pytz
@@ -174,6 +178,49 @@ OUTCOME_ALIASES = {
     "alert": "detected",
     "threat": "detected",
 }
+IPV4_TEXT_REGEX = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+SEVERITY_ALIAS_MAP = {
+    "EMERG": "CRITICAL",
+    "EMERGENCY": "CRITICAL",
+    "ALERT": "CRITICAL",
+    "CRIT": "CRITICAL",
+    "CRITICAL": "CRITICAL",
+    "ERR": "HIGH",
+    "ERROR": "HIGH",
+    "WARN": "MEDIUM",
+    "WARNING": "MEDIUM",
+    "NOTICE": "LOW",
+    "LOW": "LOW",
+    "MEDIUM": "MEDIUM",
+    "HIGH": "HIGH",
+    "INFO": "INFO",
+    "INFORMATION": "INFO",
+    "DEBUG": "INFO",
+}
+PROTOCOL_ALIAS_MAP = {
+    "TCP": "TCP",
+    "UDP": "UDP",
+    "ICMP": "ICMP",
+    "ICMPV6": "ICMPV6",
+    "GRE": "GRE",
+    "ESP": "ESP",
+    "AH": "AH",
+    "SCTP": "SCTP",
+    "TLS": "TLS",
+    "SSL": "TLS",
+    "HTTP": "HTTP",
+    "HTTPS": "HTTPS",
+    "DNS": "DNS",
+    "6": "TCP",
+    "17": "UDP",
+    "1": "ICMP",
+    "58": "ICMPV6",
+    "47": "GRE",
+    "50": "ESP",
+    "51": "AH",
+    "132": "SCTP",
+}
+ARCHIVE_PARSEABLE_EXTENSIONS = {".log", ".txt", ".csv", ".tsv"}
 
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -386,6 +433,31 @@ BASE_TEMPLATE = """
       font-size: 0.85rem;
       color: var(--muted);
     }
+    .quick-filter-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .quick-filter {
+      border: 1px solid var(--input-border);
+      background: color-mix(in srgb, var(--panel-soft) 90%, transparent);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .quick-filter:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .quick-filter.active {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 20%, var(--panel-soft) 80%);
+      color: var(--accent-strong);
+      font-weight: 700;
+    }
     .loading-wrap {
       text-align: center;
       padding: 20px;
@@ -514,6 +586,7 @@ DATATABLES = """
 
     const activeFilterEl = document.getElementById('activeFilter');
     const clearBtn = document.getElementById('clearTableFilters');
+    const quickFilterButtons = Array.from(document.querySelectorAll('[data-quick-filter-column]'));
 
     function setFilterMessage(text) {
       if (activeFilterEl) activeFilterEl.textContent = text;
@@ -530,6 +603,7 @@ DATATABLES = """
     function clearGraphFilters() {
       resetTableFilters(true);
       setFilterMessage('No graph filters active.');
+      quickFilterButtons.forEach((btn) => btn.classList.remove('active'));
     }
 
     function applyGraphFilter(columnKey, value) {
@@ -542,11 +616,31 @@ DATATABLES = """
       const pattern = '^' + $.fn.dataTable.util.escapeRegex(cleaned) + '$';
       logsTable.column(columnIdx).search(pattern, true, false).draw();
       setFilterMessage('Filter: ' + columnKey + ' = ' + cleaned);
+      quickFilterButtons.forEach((btn) => btn.classList.remove('active'));
+    }
+
+    function applyQuickFilter(columnKey, pattern, label, activeBtn) {
+      const columnIdx = columnMap[columnKey];
+      if (columnIdx === undefined || !pattern) return;
+      resetTableFilters(false);
+      logsTable.column(columnIdx).search(pattern, true, false).draw();
+      setFilterMessage('Quick filter: ' + label);
+      quickFilterButtons.forEach((btn) => btn.classList.remove('active'));
+      if (activeBtn) activeBtn.classList.add('active');
     }
 
     if (clearBtn) {
       clearBtn.addEventListener('click', clearGraphFilters);
     }
+
+    quickFilterButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const columnKey = btn.dataset.quickFilterColumn || '';
+        const pattern = btn.dataset.quickFilterPattern || '';
+        const label = btn.dataset.quickFilterLabel || (columnKey + ' matches ' + pattern);
+        applyQuickFilter(columnKey, pattern, label, btn);
+      });
+    });
 
     document.querySelectorAll('.chart-card[data-plotly-id]').forEach((card) => {
       const plotlyId = card.dataset.plotlyId || '';
@@ -790,12 +884,80 @@ def get_case_by_sid(case_id):
         ).single()
         return record["c"] if record else None
 
+def is_tgz_path(file_path):
+    name = os.path.basename(str(file_path or "")).lower()
+    return name.endswith(".tgz") or name.endswith(".tar.gz")
+
+
+def extract_tgz_members_safely(archive_path, extract_root):
+    extract_root_abs = os.path.abspath(extract_root)
+    extracted_files = []
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            member_name = str(member.name or "").strip()
+            if not member_name:
+                continue
+            if member.isdir() or member.issym() or member.islnk():
+                continue
+            target_path = os.path.abspath(os.path.join(extract_root_abs, member_name))
+            if os.path.commonpath([extract_root_abs, target_path]) != extract_root_abs:
+                continue
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            source_fh = tar.extractfile(member)
+            if source_fh is None:
+                continue
+            with source_fh:
+                with open(target_path, "wb") as dest_fh:
+                    shutil.copyfileobj(source_fh, dest_fh)
+            extracted_files.append(target_path)
+    return extracted_files
+
+
+def parse_tgz_archive(archive_path, vendor):
+    all_records = []
+    errors = []
+    with tempfile.TemporaryDirectory(prefix="eflp_tgz_", dir=UPLOADS) as extract_root:
+        extracted_files = extract_tgz_members_safely(archive_path, extract_root)
+        candidates = []
+        for path in extracted_files:
+            base_name = os.path.basename(path)
+            lower_name = base_name.lower()
+            if base_name.startswith("."):
+                continue
+            if is_tgz_path(lower_name):
+                continue
+            ext = os.path.splitext(lower_name)[1]
+            if ext in ARCHIVE_PARSEABLE_EXTENSIONS or ext == "":
+                candidates.append(path)
+
+        if not candidates:
+            raise Exception("No parseable files found in archive. Supported types: .log, .txt, .csv, .tsv")
+
+        for candidate in sorted(candidates):
+            try:
+                parsed_rows = parse_uploaded_file(candidate, vendor)
+                if parsed_rows:
+                    all_records.extend(parsed_rows)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(candidate)}: {exc}")
+
+    if all_records:
+        return all_records
+    if errors:
+        raise Exception("Unable to parse files from archive: " + "; ".join(errors[:5]))
+    raise Exception("Archive parsed successfully but no records were produced.")
+
+
 def parse_uploaded_file(file_path, vendor):
+    if is_tgz_path(file_path):
+        return parse_tgz_archive(file_path, vendor)
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext in [".csv", ".tsv"]:
         sep = "," if ext == ".csv" else "\t"
         try:
-            df = pd.read_csv(file_path, sep=sep)
+            df = pd.read_csv(file_path, sep=sep, dtype=str, keep_default_na=False)
             return df.to_dict("records")
         except Exception as e:
             raise Exception(f"Error parsing CSV/TSV file: {e}")
@@ -919,7 +1081,13 @@ def generate_export_forms(case_id, vendor):
       <input class="button" type="submit" value="Export to CSV" />
     </form>
     """
-    return es_form + influx_form + csv_form
+    json_form = f"""
+    <form action="/export_json" method="post" style="margin-bottom:15px;">
+      <input type="hidden" name="case_id" value="{safe_case_id}" />
+      <input class="button secondary" type="submit" value="Export to JSON" />
+    </form>
+    """
+    return es_form + influx_form + csv_form + json_form
 
 def generate_export_panel(case_id, vendor):
     export_forms = generate_export_forms(case_id, vendor)
@@ -968,6 +1136,191 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
         points.append(point)
     client.write_points(points)
 
+def severity_from_priority_value(value) -> str:
+    try:
+        priority = int(str(value).strip())
+    except Exception:
+        return "INFO"
+    sev_code = priority % 8
+    if sev_code <= 2:
+        return "CRITICAL"
+    if sev_code == 3:
+        return "HIGH"
+    if sev_code == 4:
+        return "MEDIUM"
+    if sev_code == 5:
+        return "LOW"
+    return "INFO"
+
+
+def canonicalize_severity_value(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "INFO"
+    upper = text.upper()
+    if upper in SEVERITY_SORT:
+        return upper
+    if upper in SEVERITY_ALIAS_MAP:
+        return SEVERITY_ALIAS_MAP[upper]
+    if re.fullmatch(r"\d+", text):
+        return severity_from_priority_value(text)
+    token = normalize_token_text(text).upper().replace(" ", "_")
+    if token in SEVERITY_ALIAS_MAP:
+        return SEVERITY_ALIAS_MAP[token]
+    return "INFO"
+
+
+def canonicalize_protocol_value(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    token = normalize_token_text(text).upper().replace(" ", "")
+    if not token or token in {"UNKNOWN", "UNSET", "NA"}:
+        return ""
+    if token in PROTOCOL_ALIAS_MAP:
+        return PROTOCOL_ALIAS_MAP[token]
+    if token.isdigit() and token in PROTOCOL_ALIAS_MAP:
+        return PROTOCOL_ALIAS_MAP[token]
+    return token[:16]
+
+
+def normalize_ip_value(value) -> str:
+    text = str(value or "").strip().strip('"').strip("'").strip(",;()")
+    if not text:
+        return ""
+    if normalize_token_text(text) in UNKNOWN_VALUE_TOKENS:
+        return ""
+
+    candidate = text
+    if candidate.startswith("[") and "]" in candidate:
+        close_idx = candidate.find("]")
+        bracket_ip = candidate[1:close_idx]
+        tail = candidate[close_idx + 1:]
+        if not tail or (tail.startswith(":") and tail[1:].isdigit()):
+            candidate = bracket_ip
+
+    if candidate.lower().startswith("::ffff:"):
+        candidate = candidate[7:]
+
+    if ":" in candidate and candidate.count(":") == 1:
+        left, right = candidate.rsplit(":", 1)
+        if IPV4_TEXT_REGEX.fullmatch(left) and right.isdigit():
+            candidate = left
+
+    candidate = candidate.strip("[]")
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        pass
+
+    match = IPV4_TEXT_REGEX.search(candidate)
+    return match.group(0) if match else ""
+
+
+def canonicalize_port_value(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if ":" in text and text.count(":") == 1:
+        left, right = text.rsplit(":", 1)
+        if IPV4_TEXT_REGEX.fullmatch(left) and right.isdigit():
+            text = right
+    if "/" in text:
+        tail = text.rsplit("/", 1)[-1]
+        if tail.isdigit():
+            text = tail
+    if not re.fullmatch(r"\d+", text):
+        return None
+    port = int(text)
+    if 0 <= port <= 65535:
+        return port
+    return None
+
+
+def extract_message_ips(text):
+    payload = str(text or "")
+    src_match = re.search(r"\b(?:src|source|client|from)\s*(?:=|:|->|\s)\s*((?:\d{1,3}\.){3}\d{1,3})\b", payload, re.IGNORECASE)
+    dst_match = re.search(r"\b(?:dst|dest|destination|server|to)\s*(?:=|:|->|\s)\s*((?:\d{1,3}\.){3}\d{1,3})\b", payload, re.IGNORECASE)
+
+    src_ip = normalize_ip_value(src_match.group(1)) if src_match else ""
+    dst_ip = normalize_ip_value(dst_match.group(1)) if dst_match else ""
+    if src_ip or dst_ip:
+        return src_ip, dst_ip
+
+    ips = IPV4_TEXT_REGEX.findall(payload)
+    if not ips:
+        return "", ""
+    if len(ips) == 1:
+        return normalize_ip_value(ips[0]), ""
+    return normalize_ip_value(ips[0]), normalize_ip_value(ips[1])
+
+
+def timestamp_has_explicit_year(value) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.search(r"(?<!\d)\d{4}(?!\d)", text):
+        return True
+    return bool(re.search(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", text))
+
+
+def roll_back_one_year(ts: pd.Timestamp) -> pd.Timestamp:
+    dt = ts.to_pydatetime()
+    try:
+        shifted = dt.replace(year=dt.year - 1)
+    except ValueError:
+        shifted = dt.replace(year=dt.year - 1, month=2, day=28)
+    adjusted = pd.Timestamp(shifted)
+    if adjusted.tzinfo is None:
+        return adjusted.tz_localize("UTC")
+    return adjusted.tz_convert("UTC")
+
+
+def adjust_missing_year_future_timestamp(parsed_ts: pd.Timestamp, raw_text: str) -> pd.Timestamp:
+    if pd.isna(parsed_ts):
+        return parsed_ts
+    if timestamp_has_explicit_year(raw_text):
+        return parsed_ts
+    future_threshold = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
+    adjusted = parsed_ts
+    for _ in range(3):
+        if adjusted <= future_threshold:
+            break
+        adjusted = roll_back_one_year(adjusted)
+    return adjusted
+
+
+def normalize_timestamp_value(value):
+    if value is None:
+        return pd.NaT
+    text = str(value).strip()
+    if not text:
+        return pd.NaT
+    cleaned = normalize_token_text(text)
+    if cleaned in UNKNOWN_VALUE_TOKENS:
+        return pd.NaT
+
+    numeric_match = re.fullmatch(r"-?\d+(?:\.\d+)?", text)
+    if numeric_match:
+        integral = text.lstrip("-").split(".", 1)[0]
+        if len(integral) >= 10:
+            try:
+                num = float(text)
+                if len(integral) >= 18:
+                    return pd.to_datetime(num, unit="ns", utc=True, errors="coerce")
+                if len(integral) >= 15:
+                    return pd.to_datetime(num, unit="us", utc=True, errors="coerce")
+                if len(integral) >= 12:
+                    return pd.to_datetime(num, unit="ms", utc=True, errors="coerce")
+                return pd.to_datetime(num, unit="s", utc=True, errors="coerce")
+            except Exception:
+                pass
+
+    parsed = pd.to_datetime(text, errors="coerce", utc=True)
+    return adjust_missing_year_future_timestamp(parsed, text)
+
+
 def ensure_network_type(df: pd.DataFrame) -> pd.DataFrame:
     nts = []
     for _, row in df.iterrows():
@@ -980,11 +1333,12 @@ def ensure_network_type(df: pd.DataFrame) -> pd.DataFrame:
             row.get("subtype", ""),
             row.get("object", ""),
             row.get("log_category", ""),
+            row.get("protocol", ""),
         ]).lower()
         t = "unknown"
-        if any(k in s for k in ["sslvpn", "nsvpn", "vpn", "citrix gateway", "globalprotect"]):
+        if any(k in s for k in ["sslvpn", "nsvpn", "vpn", "citrix gateway", "globalprotect", "wireguard", "openvpn"]):
             t = "sslvpn"
-        elif any(k in s for k in ["ike", "ipsec"]):
+        elif any(k in s for k in ["ike", "ipsec", "l2tp", "pptp"]):
             t = "ike"
         elif "appfw" in s or "app firewall" in s:
             t = "appfw"
@@ -1081,8 +1435,8 @@ def infer_outcome_from_text(text: str) -> str:
 
 def normalize_case_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     norm = df.copy()
-    norm["timestamp"] = coalesce_columns(norm, ["timestamp", "@timestamp", "time", "event_time", "generated_time"])
-    norm["severity"] = coalesce_columns(norm, ["severity", "level", "priority"], default="INFO")
+    norm["timestamp"] = coalesce_columns(norm, ["timestamp", "@timestamp", "time", "event_time", "generated_time", "eventtime", "receive_time"])
+    norm["severity"] = coalesce_columns(norm, ["severity", "level", "priority", "pri"], default="INFO")
     norm["event"] = coalesce_columns(norm, ["event", "event_type", "subtype", "log_type", "signature"])
     norm["action"] = coalesce_columns(norm, ["action", "palo_action", "result", "status", "disposition"])
     norm["outcome"] = coalesce_columns(norm, ["outcome", "status", "result", "disposition"])
@@ -1094,27 +1448,63 @@ def normalize_case_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     norm["dst_ip"] = coalesce_columns(norm, ["dst_ip", "dstip", "destination_ip", "destination", "dst", "serverip"])
     norm["src_port"] = coalesce_columns(norm, ["src_port", "srcport", "sport", "spt"])
     norm["dst_port"] = coalesce_columns(norm, ["dst_port", "dstport", "dport", "dpt"])
-    norm["protocol"] = coalesce_columns(norm, ["protocol", "proto", "service"])
+    norm["protocol"] = coalesce_columns(norm, ["protocol", "proto", "service", "transport"])
     norm["message"] = coalesce_columns(norm, ["message", "msg", "description"])
     norm["event_id"] = coalesce_columns(norm, ["event_id", "eventid", "logid", "id", "msgid"])
     norm["session_id"] = coalesce_columns(norm, ["session_id", "sessionid", "sid", "connid", "flowid"])
 
-    sev_map = {
-        "EMERG": "CRITICAL",
-        "EMERGENCY": "CRITICAL",
-        "ALERT": "CRITICAL",
-        "CRIT": "CRITICAL",
-        "CRITICAL": "CRITICAL",
-        "ERR": "HIGH",
-        "ERROR": "HIGH",
-        "WARN": "MEDIUM",
-        "WARNING": "MEDIUM",
-        "NOTICE": "LOW",
-        "INFORMATION": "INFO",
-        "DEBUG": "INFO",
-    }
-    norm["severity"] = norm["severity"].fillna("").astype(str).str.upper().replace(sev_map)
-    norm.loc[norm["severity"].str.strip().eq(""), "severity"] = "INFO"
+    norm["severity"] = norm["severity"].fillna("").astype(str).map(canonicalize_severity_value)
+
+    norm["action"] = norm["action"].fillna("").astype(str)
+    norm["action"] = norm["action"].map(lambda x: normalize_token_text(x).replace(" ", "_"))
+    missing_action = norm["action"].eq("")
+    if missing_action.any():
+        action_seed = norm["message"].fillna("").astype(str).str.lower()
+        norm.loc[missing_action & action_seed.str.contains(r"\b(deny|drop|block|reject|quarantine)\b", regex=True), "action"] = "deny"
+        norm.loc[missing_action & action_seed.str.contains(r"\b(allow|accept|permit|pass)\b", regex=True), "action"] = "allow"
+        norm.loc[missing_action & action_seed.str.contains(r"\b(login|logon)\b", regex=True), "action"] = "login"
+        norm.loc[missing_action & action_seed.str.contains(r"\blogout\b", regex=True), "action"] = "logout"
+        norm.loc[missing_action & action_seed.str.contains(r"\b(reset|teardown|close)\b", regex=True), "action"] = "close"
+
+    norm["event"] = norm["event"].fillna("").astype(str).str.strip()
+    missing_event = norm["event"].eq("")
+    if missing_event.any():
+        inferred_event = norm["message"].fillna("").astype(str).str.extract(r"\b([A-Z][A-Z0-9_]{3,})\b", expand=False).fillna("")
+        norm.loc[missing_event, "event"] = inferred_event[missing_event]
+    norm.loc[norm["event"].str.strip().eq(""), "event"] = "unknown"
+
+    norm["protocol"] = norm["protocol"].fillna("").astype(str).map(canonicalize_protocol_value)
+    missing_protocol = norm["protocol"].eq("")
+    if missing_protocol.any():
+        protocol_seed = norm["message"].fillna("").astype(str).str.lower()
+        norm.loc[missing_protocol & protocol_seed.str.contains(r"\btcp\b", regex=True), "protocol"] = "TCP"
+        norm.loc[missing_protocol & protocol_seed.str.contains(r"\budp\b", regex=True), "protocol"] = "UDP"
+        norm.loc[missing_protocol & protocol_seed.str.contains(r"\bicmpv?6?\b", regex=True), "protocol"] = "ICMP"
+        norm.loc[missing_protocol & protocol_seed.str.contains(r"\besp\b", regex=True), "protocol"] = "ESP"
+        norm.loc[missing_protocol & protocol_seed.str.contains(r"\bgre\b", regex=True), "protocol"] = "GRE"
+    norm.loc[norm["protocol"].eq(""), "protocol"] = "UNKNOWN"
+
+    norm["src_ip"] = norm["src_ip"].fillna("").astype(str).map(normalize_ip_value)
+    norm["dst_ip"] = norm["dst_ip"].fillna("").astype(str).map(normalize_ip_value)
+    missing_src = norm["src_ip"].eq("")
+    missing_dst = norm["dst_ip"].eq("")
+    if missing_src.any() or missing_dst.any():
+        ip_pairs = norm["message"].fillna("").astype(str).map(extract_message_ips)
+        msg_src = ip_pairs.map(lambda pair: pair[0])
+        msg_dst = ip_pairs.map(lambda pair: pair[1])
+        norm.loc[missing_src, "src_ip"] = msg_src[missing_src]
+        norm.loc[missing_dst, "dst_ip"] = msg_dst[missing_dst]
+
+    norm["src_port"] = norm["src_port"].map(canonicalize_port_value)
+    norm["dst_port"] = norm["dst_port"].map(canonicalize_port_value)
+    src_port_from_msg = norm["message"].fillna("").astype(str).str.extract(r"\b(?:spt|sport|srcport|source_port|src[\s_]?port)\s*[=:]\s*(\d{1,5})\b", expand=False)
+    dst_port_from_msg = norm["message"].fillna("").astype(str).str.extract(r"\b(?:dpt|dport|dstport|destination_port|dst[\s_]?port)\s*[=:]\s*(\d{1,5})\b", expand=False)
+    missing_src_port = norm["src_port"].isna()
+    missing_dst_port = norm["dst_port"].isna()
+    if missing_src_port.any():
+        norm.loc[missing_src_port, "src_port"] = src_port_from_msg[missing_src_port].map(canonicalize_port_value)
+    if missing_dst_port.any():
+        norm.loc[missing_dst_port, "dst_port"] = dst_port_from_msg[missing_dst_port].map(canonicalize_port_value)
 
     norm["log_category"] = norm["log_category"].fillna("").astype(str).map(canonicalize_log_category_value)
     missing_category = norm["log_category"].eq("")
@@ -1123,7 +1513,8 @@ def normalize_case_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             coalesce_columns(norm, ["category", "type", "subtype"]).fillna("").astype(str) + " " +
             norm["message"].fillna("").astype(str) + " " +
             norm["event"].fillna("").astype(str) + " " +
-            norm["action"].fillna("").astype(str)
+            norm["action"].fillna("").astype(str) + " " +
+            norm["protocol"].fillna("").astype(str)
         )
         norm.loc[missing_category, "log_category"] = category_seed[missing_category].map(infer_log_category_from_text)
     norm["log_category"] = norm["log_category"].fillna("").astype(str).map(canonicalize_log_category_value)
@@ -1141,8 +1532,12 @@ def normalize_case_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     norm["outcome"] = norm["outcome"].fillna("").astype(str).map(canonicalize_outcome_value)
     norm.loc[norm["outcome"].eq(""), "outcome"] = "unknown"
 
+    raw_timestamp = norm["timestamp"].fillna("").astype(str)
+    norm["timestamp_dt"] = raw_timestamp.map(normalize_timestamp_value)
+    rendered_timestamp = norm["timestamp_dt"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    norm["timestamp"] = rendered_timestamp.where(norm["timestamp_dt"].notna(), raw_timestamp.str.strip()).fillna("")
+
     norm = ensure_network_type(norm)
-    norm["timestamp_dt"] = pd.to_datetime(norm["timestamp"], errors="coerce", utc=True)
 
     return norm
 
@@ -1159,7 +1554,7 @@ def index():
     upload_form = """
     <div class='panel'>
       <h2>Upload Logs</h2>
-      <p style="margin-top:0;color:#86b9a8;">Upload a vendor dump and EFLP will normalize traffic, authentication, VPN, threat, system, and configuration events for forensic triage.</p>
+      <p style="margin-top:0;color:#86b9a8;">Upload a vendor dump (`.log`, `.txt`, `.csv`, `.tsv`, `.tgz`) and EFLP will normalize traffic, authentication, VPN, threat, system, and configuration events for forensic triage.</p>
       <form action="/upload" method="post" enctype="multipart/form-data">
         <label>Case Label:</label>
         <input type="text" name="label" placeholder="Case label" />
@@ -1179,13 +1574,13 @@ def index():
             <option value="netscaler">Netscaler (Citrix ADC)</option>
         </select>
         <label>Log File:</label>
-        <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv" />
+        <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv,.tgz,.tar.gz" />
         <input class="button" type="submit" value="Upload" />
       </form>
     </div>
     """
     content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.1.3", content)
+    return render_page("EFLP", "EFLP v0.1.1", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -1308,6 +1703,23 @@ def view_case(case_id):
     if not severity_counts.empty:
         ordered_index = [s for s in severity_order if s in severity_counts.index] + [s for s in severity_counts.index if s not in severity_order]
         severity_counts = severity_counts.reindex(ordered_index)
+        fig_severity = px.bar(
+            x=severity_counts.index, y=severity_counts.values,
+            color=severity_counts.index,
+            color_discrete_map={
+                "CRITICAL": "#dc2626",
+                "HIGH": "#ea580c",
+                "MEDIUM": "#ca8a04",
+                "LOW": "#16a34a",
+                "INFO": "#0891b2",
+            },
+            labels={"x": "Severity", "y": "Count"},
+            title=f"{label} - Severity Distribution",
+        )
+        fig_severity.update_layout(showlegend=False)
+        fig_severity.update_traces(text=severity_counts.values, textposition="outside", cliponaxis=False)
+        scale_bar_figure(fig_severity, tick_angle=0)
+        add_chart("Severity Distribution", fig_severity, filter_column="severity", filter_source="x")
 
     category_counts = df["log_category"].fillna("unknown").astype(str).replace("", "unknown").value_counts()
     if not category_counts.empty:
@@ -1384,6 +1796,18 @@ def view_case(case_id):
         scale_bar_figure(fig_ip, tick_angle=-45)
         add_chart("Top Source IPs", fig_ip, filter_column="src_ip", filter_source="x")
 
+    dst_ip_counts = df["dst_ip"].fillna("").astype(str)
+    dst_ip_counts = dst_ip_counts[dst_ip_counts.str.strip().ne("")].value_counts().head(20)
+    if not dst_ip_counts.empty:
+        fig_dst_ip = px.bar(
+            x=dst_ip_counts.index, y=dst_ip_counts.values,
+            labels={"x": "Destination IP", "y": "Hits"},
+            title=f"{label} - Top {min(20, len(dst_ip_counts))} Destination IPs"
+        )
+        fig_dst_ip.update_traces(text=dst_ip_counts.values, textposition="outside", cliponaxis=False)
+        scale_bar_figure(fig_dst_ip, tick_angle=-45)
+        add_chart("Top Destination IPs", fig_dst_ip, filter_column="dst_ip", filter_source="x")
+
     user_counts = df["user"].fillna("").astype(str)
     user_counts = user_counts[user_counts.str.strip().ne("")].value_counts().head(15)
     if not user_counts.empty:
@@ -1445,6 +1869,17 @@ def view_case(case_id):
         scale_bar_figure(fig_nt, tick_angle=-15)
         add_chart("Network Type Distribution", fig_nt, filter_column="network_type", filter_source="x")
 
+    protocol_counts = df["protocol"].fillna("UNKNOWN").astype(str).str.upper().replace("", "UNKNOWN").value_counts().head(12)
+    if not protocol_counts.empty:
+        fig_protocol = px.bar(
+            x=protocol_counts.index, y=protocol_counts.values,
+            labels={"x": "Protocol", "y": "Count"},
+            title=f"{label} - Protocol Distribution"
+        )
+        fig_protocol.update_traces(text=protocol_counts.values, textposition="outside", cliponaxis=False)
+        scale_bar_figure(fig_protocol, tick_angle=-20)
+        add_chart("Protocol Distribution", fig_protocol, filter_column="protocol", filter_source="x")
+
     table_df = df.drop(columns=["timestamp_dt"], errors="ignore")
     table_html, table_column_map = generate_logs_table(table_df)
     export_panel = generate_export_panel(case_id, vendor)
@@ -1452,12 +1887,22 @@ def view_case(case_id):
     total_events = len(df)
     category_total = df["log_category"].fillna("unknown").astype(str).str.lower().ne("unknown").sum()
     blocked_failed = df["outcome"].isin(["blocked", "failed"]).sum()
+    unknown_outcome = df["outcome"].fillna("unknown").astype(str).str.lower().eq("unknown").sum()
+    timestamp_valid = df["timestamp_dt"].notna().sum()
+    unique_src_ips = df["src_ip"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+    unique_dst_ips = df["dst_ip"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()
     top_severity = severity_counts.index[0] if not severity_counts.empty else "INFO"
+    category_pct = (category_total / total_events * 100.0) if total_events else 0.0
+    timestamp_pct = (timestamp_valid / total_events * 100.0) if total_events else 0.0
     stats_html = f"""
       <div class="stats-grid">
         <div class="stat-card"><div class="label">Total Events</div><div class="value">{int(total_events)}</div></div>
-        <div class="stat-card"><div class="label">Categorized Events</div><div class="value">{int(category_total)}</div></div>
+        <div class="stat-card"><div class="label">Categorized Events</div><div class="value">{int(category_total)} ({category_pct:.1f}%)</div></div>
         <div class="stat-card"><div class="label">Blocked/Failed</div><div class="value">{int(blocked_failed)}</div></div>
+        <div class="stat-card"><div class="label">Unknown Outcome</div><div class="value">{int(unknown_outcome)}</div></div>
+        <div class="stat-card"><div class="label">Timestamp Coverage</div><div class="value">{int(timestamp_valid)} ({timestamp_pct:.1f}%)</div></div>
+        <div class="stat-card"><div class="label">Unique Source IPs</div><div class="value">{int(unique_src_ips)}</div></div>
+        <div class="stat-card"><div class="label">Unique Destination IPs</div><div class="value">{int(unique_dst_ips)}</div></div>
         <div class="stat-card"><div class="label">Top Severity</div><div class="value">{top_severity}</div></div>
       </div>
     """
@@ -1476,6 +1921,13 @@ def view_case(case_id):
       <div class="panel">
         <h3>Graph-to-Table Filters</h3>
         <p class="filter-hint">Click a chart bar/slice/area to filter log rows by that value.</p>
+        <div class="quick-filter-row">
+          <button class="quick-filter" type="button" data-quick-filter-column="severity" data-quick-filter-pattern="^(CRITICAL|HIGH)$" data-quick-filter-label="Severity = CRITICAL/HIGH">Critical + High</button>
+          <button class="quick-filter" type="button" data-quick-filter-column="outcome" data-quick-filter-pattern="^(blocked|failed)$" data-quick-filter-label="Outcome = blocked/failed">Blocked + Failed</button>
+          <button class="quick-filter" type="button" data-quick-filter-column="log_category" data-quick-filter-pattern="^(threat|malware)$" data-quick-filter-label="Category = threat/malware">Threat + Malware</button>
+          <button class="quick-filter" type="button" data-quick-filter-column="log_category" data-quick-filter-pattern="^(authentication|vpn)$" data-quick-filter-label="Category = authentication/vpn">Auth + VPN</button>
+          <button class="quick-filter" type="button" data-quick-filter-column="action" data-quick-filter-pattern="^(deny|reset|close)$" data-quick-filter-label="Action = deny/reset/close">Deny/Reset/Close</button>
+        </div>
         <button id="clearTableFilters" class="button secondary" type="button">Clear Graph Filters</button>
         <p id="activeFilter" class="filter-hint">No graph filters active.</p>
       </div>
@@ -1571,6 +2023,21 @@ def export_csv():
                     mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment;filename={filename}"})
 
+
+@app.route("/export_json", methods=["POST"])
+def export_json():
+    case_id = request.form.get("case_id")
+    case, parsed_data = load_case_data(case_id)
+    if not case:
+        return render_page("Error", "Error", parsed_data)
+    export_records = normalized_records_for_case(case, parsed_data)
+    json_payload = json.dumps(export_records, ensure_ascii=False, indent=2, default=str)
+    filename = f"{case['label'].replace(' ', '_')}_logs.json"
+    return Response(
+        json_payload,
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
-
