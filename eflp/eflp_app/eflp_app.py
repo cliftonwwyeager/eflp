@@ -7,14 +7,16 @@ import json
 import re
 import ipaddress
 import shutil
+import socket
 import tarfile
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 import pytz
 import pandas as pd
 import plotly.express as px
-from flask import Flask, request, Response, jsonify, render_template_string, send_file
+from flask import Flask, request, Response, jsonify, render_template_string, send_file, redirect
 from dateutil import parser as date_parser
 from elasticsearch import Elasticsearch, helpers
 from influxdb import InfluxDBClient
@@ -57,9 +59,23 @@ PARSERS = {
     "sophos_xgs": SophosXGSParser,
     "netscaler": NetscalerParser  # NEW
 }
+VENDOR_LABELS = {
+    "palo_alto": "Palo Alto",
+    "fortigate": "Fortigate",
+    "sonicwall": "SonicWall",
+    "cisco_ftd": "Cisco FTD",
+    "checkpoint": "Check Point",
+    "meraki": "Meraki",
+    "unifi": "UniFi",
+    "juniper": "Juniper",
+    "watchguard": "WatchGuard",
+    "sophos_utm": "Sophos UTM",
+    "sophos_xgs": "Sophos XGS",
+    "netscaler": "Netscaler (Citrix ADC)",
+}
 CASE_PARSE_STATUS = {}
 CASE_DATA_CACHE = {}
-CASE_STATE_LOCK = threading.Lock()
+CASE_STATE_LOCK = threading.RLock()
 PLOTLY_DIV_ID_RE = re.compile(r'<div id="([^"]+)" class="plotly-graph-div"')
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SEVERITY_SORT = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
@@ -221,6 +237,64 @@ PROTOCOL_ALIAS_MAP = {
     "132": "SCTP",
 }
 ARCHIVE_PARSEABLE_EXTENSIONS = {".log", ".txt", ".csv", ".tsv"}
+TRAFFIC_TOTAL_BYTE_FIELDS = [
+    "bytes",
+    "byte",
+    "total_bytes",
+    "bytes_total",
+    "totalbyte",
+    "totalbytes",
+    "octets",
+    "session_bytes",
+    "conn_bytes",
+]
+TRAFFIC_IN_BYTE_FIELDS = [
+    "bytes_in",
+    "in_bytes",
+    "bytes_received",
+    "received_bytes",
+    "recv_bytes",
+    "rcvd_bytes",
+    "rx_bytes",
+    "rcvdbyte",
+    "rcvdbytes",
+    "inbyte",
+    "inbytes",
+    "server_bytes",
+    "dst_bytes",
+]
+TRAFFIC_OUT_BYTE_FIELDS = [
+    "bytes_out",
+    "out_bytes",
+    "bytes_sent",
+    "sent_bytes",
+    "tx_bytes",
+    "sentbyte",
+    "sentbytes",
+    "outbyte",
+    "outbytes",
+    "client_bytes",
+    "src_bytes",
+]
+SYSLOG_ENABLED = os.environ.get("EFLP_SYSLOG_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+SYSLOG_BIND_HOST = os.environ.get("EFLP_SYSLOG_HOST", "0.0.0.0")
+SYSLOG_PORT = int(os.environ.get("EFLP_SYSLOG_PORT", "5514"))
+SYSLOG_PACKET_BYTES = int(os.environ.get("EFLP_SYSLOG_PACKET_BYTES", "65535"))
+LIVE_CASE_CACHE_LIMIT = int(os.environ.get("EFLP_LIVE_CASE_CACHE_LIMIT", "100000"))
+LIVE_DASHBOARD_WINDOW = int(os.environ.get("EFLP_LIVE_DASHBOARD_WINDOW", "5000"))
+LIVE_RECENT_LIMIT = int(os.environ.get("EFLP_LIVE_RECENT_LIMIT", "50"))
+SYSLOG_ROUTES = []
+SYSLOG_ROUTE_LOCK = threading.Lock()
+SYSLOG_LISTENER_THREAD = None
+SYSLOG_LISTENER_STATE = {
+    "enabled": SYSLOG_ENABLED,
+    "status": "stopped",
+    "message": "Syslog listener has not started.",
+    "bind_host": SYSLOG_BIND_HOST,
+    "port": SYSLOG_PORT,
+    "updated": time.time(),
+}
+PARSER_INSTANCES = {}
 
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -372,6 +446,55 @@ BASE_TEMPLATE = """
       margin-top: 3px;
       font-size: 1.25rem;
       font-weight: 700;
+    }
+    .case-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--input-border);
+      border-radius: 999px;
+      padding: 3px 9px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.2;
+    }
+    .badge.live {
+      border-color: var(--accent);
+      color: var(--accent-strong);
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px 14px;
+    }
+    .form-field label {
+      display: block;
+      margin-top: 4px;
+    }
+    .live-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .live-table td {
+      vertical-align: top;
+      max-width: 380px;
+      overflow-wrap: anywhere;
+    }
+    .plot-target {
+      width: 100%;
+      min-height: 280px;
     }
     .chart-grid {
       display: grid;
@@ -692,6 +815,19 @@ def resolve_case_sidecar_path(case_id, sidecar_name):
     return safe_case_id, sidecar_path
 
 
+def resolve_case_artifact_path(case_id, sidecar_name, extension="json"):
+    safe_case_id = str(case_id or "").strip()
+    safe_sidecar = re.sub(r"[^a-z0-9_-]+", "_", str(sidecar_name or "").lower()).strip("_")
+    safe_extension = re.sub(r"[^a-z0-9]+", "", str(extension or "json").lower())
+    if not CASE_ID_RE.fullmatch(safe_case_id) or not safe_sidecar or not safe_extension:
+        return None, None
+    uploads_root = os.path.abspath(UPLOADS)
+    artifact_path = os.path.abspath(os.path.join(uploads_root, f"{safe_case_id}.{safe_sidecar}.{safe_extension}"))
+    if os.path.commonpath([uploads_root, artifact_path]) != uploads_root:
+        return None, None
+    return safe_case_id, artifact_path
+
+
 def set_case_parse_status(case_id, status, message="", records=0):
     safe_case_id, status_path = resolve_case_sidecar_path(case_id, "status")
     if not safe_case_id:
@@ -763,6 +899,63 @@ def get_cached_case_data(case_id):
         except Exception:
             return None
     return None
+
+
+def get_live_case_records(case_id, limit=None):
+    safe_case_id, live_path = resolve_case_artifact_path(case_id, "live", "jsonl")
+    if not safe_case_id:
+        return []
+    with CASE_STATE_LOCK:
+        cached = CASE_DATA_CACHE.get(safe_case_id)
+        if isinstance(cached, list):
+            if limit is None:
+                return list(cached)
+            return list(cached[-int(limit):])
+
+    records = []
+    if os.path.exists(live_path):
+        try:
+            with open(live_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        records.append(item)
+        except Exception:
+            records = []
+
+    if len(records) > LIVE_CASE_CACHE_LIMIT:
+        records = records[-LIVE_CASE_CACHE_LIMIT:]
+    with CASE_STATE_LOCK:
+        CASE_DATA_CACHE[safe_case_id] = list(records)
+    if limit is None:
+        return records
+    return records[-int(limit):]
+
+
+def append_live_case_record(case_id, record):
+    safe_case_id, live_path = resolve_case_artifact_path(case_id, "live", "jsonl")
+    if not safe_case_id:
+        return 0
+    payload = dict(record or {})
+    with CASE_STATE_LOCK:
+        records = CASE_DATA_CACHE.get(safe_case_id)
+        if not isinstance(records, list):
+            records = get_live_case_records(safe_case_id)
+        records.append(payload)
+        if len(records) > LIVE_CASE_CACHE_LIMIT:
+            records = records[-LIVE_CASE_CACHE_LIMIT:]
+        CASE_DATA_CACHE[safe_case_id] = records
+        count = len(records)
+        with open(live_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    set_case_parse_status(safe_case_id, "ready", "Live syslog ingestion active.", records=count)
+    return count
 
 
 def parse_case_background(case_id, file_path, vendor):
@@ -851,7 +1044,7 @@ def render_case_loading_page(case_id, label, vendor):
     """
     return render_page("Parsing Upload", "Case Loading", content)
 
-def store_case(case_id, label, vendor, path):
+def store_case(case_id, label, vendor, path, ingestion_mode="upload", source_match="", syslog_port=None):
     with driver.session() as session:
         session.run(
             """
@@ -860,10 +1053,21 @@ def store_case(case_id, label, vendor, path):
                 label: $label,
                 vendor: $vendor,
                 path: $path,
+                ingestion_mode: $ingestion_mode,
+                source_match: $source_match,
+                syslog_port: $syslog_port,
+                live_enabled: $live_enabled,
                 created: timestamp()
             })
             """,
-            sid=case_id, label=label, vendor=vendor, path=path
+            sid=case_id,
+            label=label,
+            vendor=vendor,
+            path=path,
+            ingestion_mode=ingestion_mode,
+            source_match=source_match,
+            syslog_port=syslog_port,
+            live_enabled=(ingestion_mode == "syslog"),
         )
 
 def get_all_cases():
@@ -871,7 +1075,13 @@ def get_all_cases():
         result = session.run(
             """
             MATCH (c:Case)
-            RETURN c.sid AS sid, c.label AS label, c.vendor AS vendor
+            RETURN c.sid AS sid,
+                   c.label AS label,
+                   c.vendor AS vendor,
+                   c.path AS path,
+                   coalesce(c.ingestion_mode, 'upload') AS ingestion_mode,
+                   coalesce(c.source_match, '') AS source_match,
+                   coalesce(c.live_enabled, false) AS live_enabled
             ORDER BY c.created DESC
             """
         )
@@ -883,6 +1093,14 @@ def get_case_by_sid(case_id):
             "MATCH (c:Case {sid: $sid}) RETURN c LIMIT 1", sid=case_id
         ).single()
         return record["c"] if record else None
+
+
+def is_live_case(case):
+    if not case:
+        return False
+    mode = str(case.get("ingestion_mode", "") or "").lower()
+    path = str(case.get("path", "") or "").lower()
+    return mode == "syslog" or path.startswith("syslog://")
 
 def is_tgz_path(file_path):
     name = os.path.basename(str(file_path or "")).lower()
@@ -968,6 +1186,410 @@ def parse_uploaded_file(file_path, vendor):
         parser = parser_cls()
         return parser.parse(file_path)
 
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_parser_instance(vendor):
+    parser_cls = PARSERS.get(vendor)
+    if not parser_cls:
+        return None
+    parser = PARSER_INSTANCES.get(vendor)
+    if parser is None:
+        parser = parser_cls()
+        PARSER_INSTANCES[vendor] = parser
+    return parser
+
+
+def clean_syslog_source_match(source_match):
+    text = str(source_match or "").strip()
+    if not text:
+        return ""
+    try:
+        if "/" in text:
+            return str(ipaddress.ip_network(text, strict=False))
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        raise ValueError("Source match must be a valid IP address or CIDR network.")
+
+
+def source_match_score(route_source, source_ip):
+    source_text = str(route_source or "").strip()
+    if not source_text:
+        return 0
+    try:
+        addr = ipaddress.ip_address(source_ip)
+    except ValueError:
+        return -1
+    try:
+        if "/" in source_text:
+            network = ipaddress.ip_network(source_text, strict=False)
+            return network.prefixlen if addr in network else -1
+        return 256 if addr == ipaddress.ip_address(source_text) else -1
+    except ValueError:
+        return -1
+
+
+def set_syslog_listener_state(status, message="", **extra):
+    with SYSLOG_ROUTE_LOCK:
+        SYSLOG_LISTENER_STATE.update(
+            {
+                "enabled": SYSLOG_ENABLED,
+                "status": status,
+                "message": message,
+                "bind_host": SYSLOG_BIND_HOST,
+                "port": SYSLOG_PORT,
+                "updated": time.time(),
+            }
+        )
+        SYSLOG_LISTENER_STATE.update(extra)
+
+
+def get_syslog_listener_state():
+    with SYSLOG_ROUTE_LOCK:
+        state = dict(SYSLOG_LISTENER_STATE)
+        state["routes"] = len(SYSLOG_ROUTES)
+    return state
+
+
+def register_syslog_route(case_id, label, vendor, source_match=""):
+    route = {
+        "case_id": str(case_id),
+        "label": str(label or "Live Syslog"),
+        "vendor": str(vendor or ""),
+        "source_match": str(source_match or ""),
+    }
+    with SYSLOG_ROUTE_LOCK:
+        SYSLOG_ROUTES[:] = [item for item in SYSLOG_ROUTES if item.get("case_id") != route["case_id"]]
+        SYSLOG_ROUTES.insert(0, route)
+
+
+def refresh_syslog_routes_from_db():
+    try:
+        with driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (c:Case)
+                WHERE coalesce(c.ingestion_mode, '') = 'syslog'
+                  AND coalesce(c.live_enabled, true) = true
+                RETURN c.sid AS case_id,
+                       c.label AS label,
+                       c.vendor AS vendor,
+                       coalesce(c.source_match, '') AS source_match
+                ORDER BY c.created DESC
+                """
+            ).data()
+    except Exception as exc:
+        set_syslog_listener_state("degraded", f"Listening, but route refresh failed: {exc}")
+        return
+
+    with SYSLOG_ROUTE_LOCK:
+        SYSLOG_ROUTES[:] = [
+            {
+                "case_id": row.get("case_id", ""),
+                "label": row.get("label", "Live Syslog"),
+                "vendor": row.get("vendor", ""),
+                "source_match": row.get("source_match", ""),
+            }
+            for row in rows
+            if row.get("case_id") and row.get("vendor") in PARSERS
+        ]
+
+
+def find_syslog_route(source_ip):
+    with SYSLOG_ROUTE_LOCK:
+        routes = list(SYSLOG_ROUTES)
+    best_route = None
+    best_score = -1
+    for route in routes:
+        score = source_match_score(route.get("source_match", ""), source_ip)
+        if score > best_score:
+            best_route = route
+            best_score = score
+    return best_route if best_score >= 0 else None
+
+
+def category_from_parser_hint(parser, raw_fields, payload, vendor):
+    if vendor == "netscaler" and hasattr(parser, "_category_from_tag"):
+        tag = raw_fields.get("tag") or raw_fields.get("module") or raw_fields.get("event")
+        return parser._category_from_tag(tag, payload)
+
+    type_map = getattr(parser, "TYPE_TO_CATEGORY", {}) or {}
+    candidates = [
+        raw_fields.get("type"),
+        raw_fields.get("log_type"),
+        raw_fields.get("subtype"),
+        raw_fields.get("eventtype"),
+        raw_fields.get("category"),
+        raw_fields.get("cat"),
+        raw_fields.get("c"),
+        raw_fields.get("module"),
+        raw_fields.get("service"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value:
+            continue
+        if value in type_map:
+            return type_map[value]
+        if value.lower() in type_map:
+            return type_map[value.lower()]
+        if value.upper() in type_map:
+            return type_map[value.upper()]
+    return infer_log_category_from_text(f"{payload} {' '.join(str(v or '') for v in candidates)}")
+
+
+def parse_live_syslog_line(line, vendor, source_ip=""):
+    parser = get_parser_instance(vendor)
+    if not parser:
+        raise ValueError(f"Unsupported vendor '{vendor}'.")
+
+    text = str(line or "").strip()
+    meta = parser.parse_syslog_prefix(text) or {}
+    payload = meta.get("payload") or text
+    raw_fields = {}
+    raw_fields.update(parser.parse_kv_pairs(payload))
+    raw_fields.update(parser.parse_json_line(payload))
+
+    if vendor == "cisco_ftd" and hasattr(parser, "_parse_name_values"):
+        raw_fields.update(parser._parse_name_values(payload))
+
+    tagged = None
+    if vendor == "netscaler" and hasattr(parser, "SYSLOG_RE"):
+        tagged = parser.SYSLOG_RE.match(text)
+        if tagged:
+            raw_fields.setdefault("tag", tagged.group("tag") or "")
+            payload = tagged.group("msg") or payload
+            meta.setdefault("timestamp", tagged.group("ts") or "")
+            meta.setdefault("host", tagged.group("host") or "")
+
+    palo_fields = []
+    palo_type = ""
+    palo_subtype = ""
+    palo_src_ip = ""
+    palo_dst_ip = ""
+    palo_src_port = None
+    palo_dst_port = None
+    palo_action = ""
+    palo_rule = ""
+    palo_bytes_in = None
+    palo_bytes_out = None
+    palo_bytes_total = None
+    if vendor == "palo_alto" and hasattr(parser, "_parse_csv_fields"):
+        palo_fields = parser._parse_csv_fields(payload)
+        if palo_fields:
+            palo_type, palo_subtype = parser._extract_type_subtype(palo_fields, raw_fields)
+            palo_action = parser._extract_action(palo_fields, raw_fields, payload)
+            palo_src_ip, palo_dst_ip, palo_src_port, palo_dst_port = parser._extract_network_tuple(palo_fields, raw_fields)
+            if len(palo_fields) > 31 and palo_type == "TRAFFIC":
+                palo_rule = palo_fields[10]
+                palo_bytes_total = traffic_int_value(palo_fields[29])
+                palo_bytes_out = traffic_int_value(palo_fields[30])
+                palo_bytes_in = traffic_int_value(palo_fields[31])
+            if palo_type:
+                raw_fields.setdefault("type", palo_type)
+            if palo_subtype:
+                raw_fields.setdefault("subtype", palo_subtype)
+            if palo_rule:
+                raw_fields.setdefault("rule", palo_rule)
+            if palo_bytes_total is not None:
+                raw_fields.setdefault("bytes", palo_bytes_total)
+            if palo_bytes_out is not None:
+                raw_fields.setdefault("bytes_sent", palo_bytes_out)
+            if palo_bytes_in is not None:
+                raw_fields.setdefault("bytes_received", palo_bytes_in)
+
+    cisco_src_ip = ""
+    cisco_dst_ip = ""
+    cisco_src_port = None
+    cisco_dst_port = None
+    cisco_msg_id = ""
+    cisco_sev = ""
+    if vendor == "cisco_ftd" and hasattr(parser, "MSG_ID_REGEX"):
+        msg_match = parser.MSG_ID_REGEX.search(payload)
+        if msg_match:
+            cisco_msg_id = msg_match.group("msg_id") or ""
+            cisco_sev = msg_match.group("sev") or ""
+        if hasattr(parser, "_extract_asa_network_tuple"):
+            cisco_src_ip, cisco_src_port, cisco_dst_ip, cisco_dst_port = parser._extract_asa_network_tuple(payload)
+
+    received_at = utc_now_iso()
+    date_part = parser.dict_first(raw_fields, ["date", "logdate", "eventdate", "devdate"])
+    time_part = parser.dict_first(raw_fields, ["time", "eventtime", "devtime"])
+    compound_ts = f"{date_part} {time_part}".strip() if date_part or time_part else ""
+    category = category_from_parser_hint(parser, raw_fields, payload, vendor)
+    action = parser.normalize_action(
+        parser.first_value(
+            raw_fields.get("action"),
+            raw_fields.get("act"),
+            raw_fields.get("result"),
+            raw_fields.get("status"),
+            raw_fields.get("disposition"),
+            palo_action,
+        ),
+        payload,
+    )
+    bytes_in = traffic_first_value({"raw_fields": raw_fields}, TRAFFIC_IN_BYTE_FIELDS)
+    bytes_out = traffic_first_value({"raw_fields": raw_fields}, TRAFFIC_OUT_BYTE_FIELDS)
+    bytes_total = traffic_first_value({"raw_fields": raw_fields}, TRAFFIC_TOTAL_BYTE_FIELDS)
+    traffic_bytes = bytes_total if bytes_total is not None else int((bytes_in or 0) + (bytes_out or 0))
+    if traffic_bytes <= 0:
+        traffic_bytes = traffic_amount_from_text(payload, text) or 0
+
+    record = {
+        "vendor": vendor,
+        "timestamp": parser.first_value(
+            raw_fields.get("@timestamp"),
+            raw_fields.get("timestamp"),
+            raw_fields.get("event_time"),
+            raw_fields.get("generated_time"),
+            raw_fields.get("receive_time"),
+            raw_fields.get("eventtime"),
+            compound_ts,
+            meta.get("timestamp"),
+            received_at,
+        ),
+        "received_at": received_at,
+        "ingestion_mode": "syslog",
+        "ingest_source": source_ip,
+        "host": parser.first_value(
+            meta.get("host"),
+            raw_fields.get("host"),
+            raw_fields.get("hostname"),
+            raw_fields.get("device"),
+            raw_fields.get("devname"),
+        ),
+        "severity": parser.first_value(
+            raw_fields.get("severity"),
+            raw_fields.get("level"),
+            raw_fields.get("risk"),
+            raw_fields.get("priority"),
+            raw_fields.get("pri"),
+            cisco_sev,
+            meta.get("priority"),
+        ),
+        "message": parser.first_value(
+            raw_fields.get("msg"),
+            raw_fields.get("message"),
+            raw_fields.get("description"),
+            raw_fields.get("reason"),
+            payload,
+        ),
+        "event": parser.first_value(
+            raw_fields.get("event"),
+            raw_fields.get("event_type"),
+            raw_fields.get("eventtype"),
+            raw_fields.get("subtype"),
+            raw_fields.get("log_type"),
+            raw_fields.get("signature"),
+            raw_fields.get("msgid"),
+            cisco_msg_id,
+            palo_subtype,
+            palo_type,
+        ),
+        "event_id": parser.first_value(raw_fields.get("eventid"), raw_fields.get("event_id"), raw_fields.get("id"), raw_fields.get("logid"), raw_fields.get("msgid"), cisco_msg_id),
+        "action": action,
+        "log_category": category,
+        "src_ip": parser.first_value(raw_fields.get("src_ip"), raw_fields.get("srcip"), raw_fields.get("src"), raw_fields.get("source_ip"), raw_fields.get("source"), raw_fields.get("sip"), raw_fields.get("clientip"), palo_src_ip, cisco_src_ip),
+        "dst_ip": parser.first_value(raw_fields.get("dst_ip"), raw_fields.get("dstip"), raw_fields.get("dst"), raw_fields.get("destination_ip"), raw_fields.get("destination"), raw_fields.get("dip"), raw_fields.get("serverip"), palo_dst_ip, cisco_dst_ip),
+        "src_port": parser.first_value(raw_fields.get("src_port"), raw_fields.get("srcport"), raw_fields.get("sport"), raw_fields.get("spt"), palo_src_port, cisco_src_port),
+        "dst_port": parser.first_value(raw_fields.get("dst_port"), raw_fields.get("dstport"), raw_fields.get("dport"), raw_fields.get("dpt"), palo_dst_port, cisco_dst_port),
+        "protocol": parser.first_value(raw_fields.get("protocol"), raw_fields.get("proto"), raw_fields.get("service"), raw_fields.get("transport")),
+        "rule": parser.first_value(raw_fields.get("rule"), raw_fields.get("rulename"), raw_fields.get("policy"), raw_fields.get("policyid"), raw_fields.get("policyname"), raw_fields.get("acl"), palo_rule),
+        "user": parser.first_value(raw_fields.get("user"), raw_fields.get("username"), raw_fields.get("srcuser"), raw_fields.get("dstuser"), raw_fields.get("account"), raw_fields.get("userid")),
+        "signature": parser.first_value(raw_fields.get("signature"), raw_fields.get("attack"), raw_fields.get("threat"), raw_fields.get("sig"), raw_fields.get("sig_name")),
+        "session_id": parser.first_value(raw_fields.get("session_id"), raw_fields.get("sessionid"), raw_fields.get("sid"), raw_fields.get("connid"), raw_fields.get("flowid")),
+        "bytes_in": bytes_in,
+        "bytes_out": bytes_out,
+        "bytes_total": bytes_total,
+        "traffic_bytes": traffic_bytes,
+        "raw_message": text,
+        "raw_fields": raw_fields,
+        "syslog_priority": meta.get("priority"),
+    }
+    return parser.enrich_record(record, vendor=vendor, default_category=category)
+
+
+def handle_syslog_datagram(data, addr):
+    source_ip = addr[0] if addr else ""
+    raw_text = data.decode("utf-8", errors="replace")
+    lines = [line.strip("\x00\r ") for line in raw_text.splitlines() if line.strip("\x00\r ")]
+    if not lines and raw_text.strip():
+        lines = [raw_text.strip("\x00\r ")]
+
+    accepted = 0
+    dropped = 0
+    errors = 0
+    for line in lines:
+        route = find_syslog_route(source_ip)
+        if not route:
+            dropped += 1
+            continue
+        try:
+            record = parse_live_syslog_line(line, route["vendor"], source_ip=source_ip)
+            append_live_case_record(route["case_id"], record)
+            accepted += 1
+        except Exception:
+            errors += 1
+
+    state = get_syslog_listener_state()
+    set_syslog_listener_state(
+        state.get("status", "listening"),
+        state.get("message", "Listening for syslog."),
+        accepted=int(state.get("accepted", 0)) + accepted,
+        dropped=int(state.get("dropped", 0)) + dropped,
+        errors=int(state.get("errors", 0)) + errors,
+        last_source=source_ip,
+        last_received=utc_now_iso() if accepted or dropped or errors else state.get("last_received", ""),
+    )
+
+
+def syslog_listener_loop():
+    if not SYSLOG_ENABLED:
+        set_syslog_listener_state("disabled", "Set EFLP_SYSLOG_ENABLED=true to enable UDP syslog ingestion.")
+        return
+    refresh_syslog_routes_from_db()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(1.0)
+        sock.bind((SYSLOG_BIND_HOST, SYSLOG_PORT))
+    except Exception as exc:
+        set_syslog_listener_state("error", f"Unable to bind UDP syslog listener: {exc}")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return
+
+    set_syslog_listener_state("listening", f"Listening for UDP syslog on {SYSLOG_BIND_HOST}:{SYSLOG_PORT}.")
+    last_refresh = time.time()
+    while True:
+        try:
+            if time.time() - last_refresh > 30:
+                refresh_syslog_routes_from_db()
+                last_refresh = time.time()
+            data, addr = sock.recvfrom(SYSLOG_PACKET_BYTES)
+            handle_syslog_datagram(data, addr)
+        except socket.timeout:
+            continue
+        except Exception as exc:
+            set_syslog_listener_state("degraded", f"Syslog receive error: {exc}")
+            time.sleep(0.25)
+
+
+def ensure_syslog_listener_started():
+    global SYSLOG_LISTENER_THREAD
+    if not SYSLOG_ENABLED:
+        set_syslog_listener_state("disabled", "Set EFLP_SYSLOG_ENABLED=true to enable UDP syslog ingestion.")
+        return
+    if SYSLOG_LISTENER_THREAD and SYSLOG_LISTENER_THREAD.is_alive():
+        return
+    SYSLOG_LISTENER_THREAD = threading.Thread(target=syslog_listener_loop, daemon=True)
+    SYSLOG_LISTENER_THREAD.start()
+
+
 def load_case_data(case_id):
     case = get_case_by_sid(case_id)
     if not case:
@@ -975,6 +1597,9 @@ def load_case_data(case_id):
     cached = get_cached_case_data(case_id)
     if cached is not None:
         return case, cached
+    if is_live_case(case):
+        records = get_live_case_records(case_id)
+        return case, records
     vendor = case["vendor"]
     file_path = case["path"]
     try:
@@ -1541,17 +2166,248 @@ def normalize_case_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     return norm
 
+
+def count_items(series, order=None, limit=None):
+    cleaned = series.fillna("").astype(str).replace("", "unknown")
+    counts = cleaned.value_counts()
+    if order:
+        ordered = [item for item in order if item in counts.index]
+        ordered += [item for item in counts.index if item not in ordered]
+        counts = counts.reindex(ordered)
+    if limit:
+        counts = counts.head(int(limit))
+    return [{"label": str(label), "value": int(value)} for label, value in counts.items()]
+
+
+def traffic_int_value(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        amount = int(float(match.group(0)))
+    except ValueError:
+        return None
+    return amount if amount >= 0 else None
+
+
+def traffic_first_value(row, field_names):
+    raw_fields = row.get("raw_fields", {})
+    if not isinstance(raw_fields, dict):
+        raw_fields = {}
+    for field in field_names:
+        for key in (field, field.lower(), field.upper()):
+            if key in row:
+                amount = traffic_int_value(row.get(key))
+                if amount is not None:
+                    return amount
+            if key in raw_fields:
+                amount = traffic_int_value(raw_fields.get(key))
+                if amount is not None:
+                    return amount
+    return None
+
+
+def traffic_amount_from_text(*values):
+    patterns = [
+        re.compile(r"\b(?:bytes|octets|bytecnt|byte_count|total_bytes)\s*(?:=|:|\s)\s*(\d[\d,]*)\b", re.IGNORECASE),
+        re.compile(r"\b(\d[\d,]*)\s+(?:bytes|octets)\b", re.IGNORECASE),
+    ]
+    for value in values:
+        text = str(value or "")
+        if not text:
+            continue
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                amount = traffic_int_value(match.group(1))
+                if amount is not None:
+                    return amount
+    return None
+
+
+def traffic_amount_from_row(row):
+    stored = traffic_first_value(row, ["traffic_bytes"])
+    if stored is not None and stored > 0:
+        return stored
+    total = traffic_first_value(row, TRAFFIC_TOTAL_BYTE_FIELDS)
+    if total is not None and total > 0:
+        return total
+    inbound = traffic_first_value(row, TRAFFIC_IN_BYTE_FIELDS) or 0
+    outbound = traffic_first_value(row, TRAFFIC_OUT_BYTE_FIELDS) or 0
+    summed = int(inbound + outbound)
+    if summed > 0:
+        return summed
+    text_total = traffic_amount_from_text(row.get("message"), row.get("raw_message"))
+    return text_total or 0
+
+
+def add_live_traffic_columns(df):
+    if df.empty:
+        df["traffic_bytes"] = []
+        return df
+    df = df.copy()
+    rows = df.to_dict("records")
+    df["traffic_bytes"] = [traffic_amount_from_row(row) for row in rows]
+    return df
+
+
+def traffic_aggregate_items(df, label_columns, limit=10, include_both_ip_columns=False):
+    totals = {}
+    if df.empty or "traffic_bytes" not in df.columns:
+        return []
+    records = df.fillna("").to_dict("records")
+    for row in records:
+        amount = traffic_int_value(row.get("traffic_bytes")) or 0
+        if amount <= 0:
+            continue
+        labels = []
+        if include_both_ip_columns:
+            labels.extend([row.get("src_ip", ""), row.get("dst_ip", "")])
+        else:
+            for col in label_columns:
+                labels.append(row.get(col, ""))
+        for label in set(labels):
+            cleaned = str(label or "").strip()
+            if not cleaned or normalize_token_text(cleaned) in UNKNOWN_VALUE_TOKENS:
+                continue
+            totals[cleaned] = totals.get(cleaned, 0) + amount
+    ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:int(limit)]
+    return [{"label": str(label), "value": int(value)} for label, value in ranked]
+
+
+def safe_table_records(df, limit=LIVE_RECENT_LIMIT):
+    columns = [
+        "timestamp", "severity", "log_category", "event", "action", "outcome",
+        "src_ip", "dst_ip", "user", "message", "ingest_source"
+    ]
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    recent_df = df.tail(int(limit)).iloc[::-1].copy()
+    recent_df = recent_df.drop(columns=["timestamp_dt"], errors="ignore")
+    return recent_df[columns].fillna("").astype(str).to_dict("records")
+
+
+def build_live_dashboard_summary(records, case, recent_limit=LIVE_RECENT_LIMIT):
+    total_records = len(records)
+    window_records = records[-LIVE_DASHBOARD_WINDOW:] if len(records) > LIVE_DASHBOARD_WINDOW else records
+    if not window_records:
+        return {
+            "case_id": case.get("sid", ""),
+            "label": case.get("label", ""),
+            "vendor": case.get("vendor", ""),
+            "total_events": 0,
+            "window_events": 0,
+            "blocked_failed": 0,
+            "critical_high": 0,
+            "unique_sources": 0,
+            "unique_destinations": 0,
+            "timestamp_coverage": 0,
+            "severity": [],
+            "categories": [],
+            "outcomes": [],
+            "timeline": [],
+            "top_sources": [],
+            "top_destinations": [],
+            "total_traffic_bytes": 0,
+            "traffic_records": 0,
+            "top_traffic_ips": [],
+            "top_traffic_rules": [],
+            "recent": [],
+        }
+
+    df = add_live_traffic_columns(normalize_case_dataframe(pd.DataFrame(window_records)))
+    blocked_failed = df["outcome"].isin(["blocked", "failed"]).sum()
+    critical_high = df["severity"].isin(["CRITICAL", "HIGH"]).sum()
+    unique_sources = df["src_ip"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+    unique_destinations = df["dst_ip"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+    timestamp_coverage = df["timestamp_dt"].notna().sum()
+    total_traffic_bytes = int(df["traffic_bytes"].fillna(0).sum())
+    traffic_records = int(df["traffic_bytes"].fillna(0).gt(0).sum())
+
+    timeline = []
+    timeline_df = df.dropna(subset=["timestamp_dt"]).copy()
+    if not timeline_df.empty:
+        timeline_df["minute_bucket"] = timeline_df["timestamp_dt"].dt.floor("min")
+        timeline_counts = timeline_df.groupby("minute_bucket").size().reset_index(name="count")
+        timeline = [
+            {"label": row["minute_bucket"].isoformat(), "value": int(row["count"])}
+            for _, row in timeline_counts.tail(120).iterrows()
+        ]
+
+    source_series = df["src_ip"].fillna("").astype(str)
+    source_series = source_series[source_series.str.strip().ne("")]
+    destination_series = df["dst_ip"].fillna("").astype(str)
+    destination_series = destination_series[destination_series.str.strip().ne("")]
+
+    return {
+        "case_id": case.get("sid", ""),
+        "label": case.get("label", ""),
+        "vendor": case.get("vendor", ""),
+        "total_events": int(total_records),
+        "window_events": int(len(df)),
+        "blocked_failed": int(blocked_failed),
+        "critical_high": int(critical_high),
+        "unique_sources": int(unique_sources),
+        "unique_destinations": int(unique_destinations),
+        "timestamp_coverage": int(timestamp_coverage),
+        "severity": count_items(df["severity"].astype(str).str.upper(), order=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]),
+        "categories": count_items(df["log_category"], order=CANONICAL_LOG_CATEGORY_ORDER, limit=12),
+        "outcomes": count_items(df["outcome"], order=CANONICAL_OUTCOME_ORDER),
+        "timeline": timeline,
+        "top_sources": count_items(source_series, limit=12),
+        "top_destinations": count_items(destination_series, limit=12),
+        "total_traffic_bytes": total_traffic_bytes,
+        "traffic_records": traffic_records,
+        "top_traffic_ips": traffic_aggregate_items(df, ["src_ip", "dst_ip"], limit=10, include_both_ip_columns=True),
+        "top_traffic_rules": traffic_aggregate_items(df, ["rule"], limit=10),
+        "recent": safe_table_records(df, limit=recent_limit),
+    }
+
+
+def vendor_options_html(selected=""):
+    selected = str(selected or "")
+    chunks = []
+    for value, label in VENDOR_LABELS.items():
+        selected_attr = " selected" if value == selected else ""
+        chunks.append(f"<option value=\"{html.escape(value)}\"{selected_attr}>{html.escape(label)}</option>")
+    return "".join(chunks)
+
 @app.route("/")
 def index():
+    ensure_syslog_listener_started()
     cases = get_all_cases()
     case_box = "<div class='case-box'><h3>All Cases</h3>"
     if cases:
         for c in cases:
-            case_box += f"<p><a href='/case/{c['sid']}'>{c['label']} ({c['vendor']})</a></p>"
+            safe_sid = html.escape(str(c.get("sid", "")))
+            safe_label = html.escape(str(c.get("label", "Untitled")))
+            vendor = str(c.get("vendor", "unknown"))
+            safe_vendor = html.escape(VENDOR_LABELS.get(vendor, vendor))
+            live = str(c.get("ingestion_mode", "")).lower() == "syslog" or c.get("live_enabled")
+            source_match = html.escape(str(c.get("source_match", "") or "any source"))
+            badge = "<span class='badge live'>syslog live</span>" if live else "<span class='badge'>upload</span>"
+            live_link = f"<a href='/live/{safe_sid}'>Live dashboard</a>" if live else ""
+            source_badge = f"<span class='badge'>{source_match}</span>" if live else ""
+            case_box += (
+                "<div class='case-row'>"
+                f"<a href='/case/{safe_sid}'>{safe_label} ({safe_vendor})</a>"
+                f"{badge}"
+                f"{source_badge}"
+                f"{live_link}"
+                "</div>"
+            )
     else:
         case_box += "<p>No cases found.</p>"
     case_box += "</div>"
-    upload_form = """
+    upload_form = f"""
     <div class='panel'>
       <h2>Upload Logs</h2>
       <p style="margin-top:0;color:#86b9a8;">Upload a vendor dump (`.log`, `.txt`, `.csv`, `.tsv`, `.tgz`) and EFLP will normalize traffic, authentication, VPN, threat, system, and configuration events for forensic triage.</p>
@@ -1560,18 +2416,7 @@ def index():
         <input type="text" name="label" placeholder="Case label" />
         <label>Vendor:</label>
         <select name="vendor">
-            <option value="palo_alto">Palo Alto</option>
-            <option value="fortigate">Fortigate</option>
-            <option value="sonicwall">SonicWall</option>
-            <option value="cisco_ftd">Cisco FTD</option>
-            <option value="checkpoint">Check Point</option>
-            <option value="meraki">Meraki</option>
-            <option value="unifi">Unifi</option>
-            <option value="juniper">Juniper</option>
-            <option value="watchguard">WatchGuard</option>
-            <option value="sophos_utm">Sophos UTM</option>
-            <option value="sophos_xgs">Sophos XGS</option>
-            <option value="netscaler">Netscaler (Citrix ADC)</option>
+            {vendor_options_html()}
         </select>
         <label>Log File:</label>
         <input type="file" name="logfile" accept=".log,.txt,.csv,.tsv,.tgz,.tar.gz" />
@@ -1579,8 +2424,41 @@ def index():
       </form>
     </div>
     """
-    content = case_box + upload_form
-    return render_page("EFLP", "EFLP v0.1.3", content)
+    state = get_syslog_listener_state()
+    listener_text = html.escape(state.get("message", "Syslog listener status unavailable."))
+    listener_status = html.escape(state.get("status", "unknown"))
+    live_form = f"""
+    <div class='panel'>
+      <h2>Live Syslog Ingestion</h2>
+      <div class="live-status">
+        <span class="badge live">{listener_status}</span>
+        <span>{listener_text}</span>
+        <span class="badge">routes: {int(state.get("routes", 0))}</span>
+        <span class="badge">accepted: {int(state.get("accepted", 0))}</span>
+        <span class="badge">dropped: {int(state.get("dropped", 0))}</span>
+      </div>
+      <form action="/syslog_case" method="post">
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Case Label:</label>
+            <input type="text" name="label" placeholder="Live firewall syslog" />
+          </div>
+          <div class="form-field">
+            <label>Vendor:</label>
+            <select name="vendor">{vendor_options_html()}</select>
+          </div>
+          <div class="form-field">
+            <label>Source IP or CIDR (optional):</label>
+            <input type="text" name="source_match" placeholder="192.0.2.10 or 192.0.2.0/24" />
+          </div>
+        </div>
+        <p class="muted">Configure the firewall to send UDP syslog to this host on port {SYSLOG_PORT}. Leaving source blank creates a fallback route for any sender.</p>
+        <input class="button" type="submit" value="Create Live Syslog Case" />
+      </form>
+    </div>
+    """
+    content = case_box + upload_form + live_form
+    return render_page("EFLP", "EFLP v0.2.0", content)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -1625,11 +2503,304 @@ def upload_status(case_id):
 
     return jsonify({"status": "queued", "message": "Waiting for parser...", "records": 0, "next_url": f"/case/{case_id}"})
 
+
+@app.route("/syslog_case", methods=["POST"])
+def create_syslog_case():
+    ensure_syslog_listener_started()
+    vendor = request.form.get("vendor", "")
+    if vendor not in PARSERS:
+        return render_page("Error", "Error", f"Unsupported vendor '{html.escape(str(vendor))}'.")
+
+    label = (request.form.get("label") or "").strip()
+    if not label:
+        label = f"Live {VENDOR_LABELS.get(vendor, vendor)} Syslog"
+    try:
+        source_match = clean_syslog_source_match(request.form.get("source_match", ""))
+    except ValueError as exc:
+        return render_page("Error", "Error", html.escape(str(exc)))
+
+    case_id = str(uuid.uuid4())
+    path = f"syslog://{SYSLOG_BIND_HOST}:{SYSLOG_PORT}"
+    store_case(
+        case_id,
+        label,
+        vendor,
+        path,
+        ingestion_mode="syslog",
+        source_match=source_match,
+        syslog_port=SYSLOG_PORT,
+    )
+    with CASE_STATE_LOCK:
+        CASE_DATA_CACHE[case_id] = []
+    set_case_parse_status(case_id, "ready", "Live syslog ingestion active.", records=0)
+    register_syslog_route(case_id, label, vendor, source_match=source_match)
+    return redirect(f"/live/{case_id}")
+
+
+@app.route("/api/case/<case_id>/live_summary")
+def api_live_summary(case_id):
+    ensure_syslog_listener_started()
+    case = get_case_by_sid(case_id)
+    if not case:
+        return jsonify({"error": "Case not found."}), 404
+    if not is_live_case(case):
+        return jsonify({"error": "Case is not configured for live syslog ingestion."}), 400
+    try:
+        recent_limit = min(max(int(request.args.get("limit", LIVE_RECENT_LIMIT)), 1), 500)
+    except ValueError:
+        recent_limit = LIVE_RECENT_LIMIT
+    records = get_live_case_records(case_id)
+    summary = build_live_dashboard_summary(records, case, recent_limit=recent_limit)
+    summary["listener"] = get_syslog_listener_state()
+    return jsonify(summary)
+
+
+def render_live_case_page(case):
+    case_id = str(case.get("sid", ""))
+    label = str(case.get("label", "Live Syslog"))
+    vendor = str(case.get("vendor", "unknown"))
+    source_match = str(case.get("source_match", "") or "any source")
+    safe_label = html.escape(label)
+    safe_vendor = html.escape(VENDOR_LABELS.get(vendor, vendor))
+    safe_source = html.escape(source_match)
+    listener = get_syslog_listener_state()
+    listener_status = html.escape(str(listener.get("status", "unknown")))
+    listener_message = html.escape(str(listener.get("message", "")))
+    export_panel = generate_export_panel(case_id, vendor)
+    js_case_id = json.dumps(case_id)
+    content = f"""
+      <h2>Live Syslog: {safe_label} ({safe_vendor})</h2>
+      <div class="panel">
+        <div class="live-status">
+          <span class="badge live" id="liveListenerStatus">{listener_status}</span>
+          <span id="liveListenerMessage">{listener_message}</span>
+          <span class="badge">source: {safe_source}</span>
+          <span class="badge">udp/{SYSLOG_PORT}</span>
+          <span class="badge" id="liveLastUpdated">waiting for data</span>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card"><div class="label">Total Events</div><div class="value" id="liveTotalEvents">0</div></div>
+        <div class="stat-card"><div class="label">Dashboard Window</div><div class="value" id="liveWindowEvents">0</div></div>
+        <div class="stat-card"><div class="label">Critical/High</div><div class="value" id="liveCriticalHigh">0</div></div>
+        <div class="stat-card"><div class="label">Blocked/Failed</div><div class="value" id="liveBlockedFailed">0</div></div>
+        <div class="stat-card"><div class="label">Unique Source IPs</div><div class="value" id="liveUniqueSources">0</div></div>
+        <div class="stat-card"><div class="label">Unique Destination IPs</div><div class="value" id="liveUniqueDestinations">0</div></div>
+        <div class="stat-card"><div class="label">Traffic Volume</div><div class="value" id="liveTrafficBytes">0 B</div></div>
+      </div>
+
+      <div class="chart-grid">
+        <section class="chart-card"><h3 class="chart-title">Severity</h3><div id="liveSeverityChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Log Categories</h3><div id="liveCategoryChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Outcomes</h3><div id="liveOutcomeChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Events per Minute</h3><div id="liveTimelineChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Top Sources</h3><div id="liveSourceChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Top Destinations</h3><div id="liveDestinationChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Top 10 IPs by Traffic</h3><div id="liveTrafficIpChart" class="plot-target"></div></section>
+        <section class="chart-card"><h3 class="chart-title">Top 10 Rules by Traffic</h3><div id="liveTrafficRuleChart" class="plot-target"></div></section>
+      </div>
+
+      <h3>Recent Live Events</h3>
+      <div class="scroll-box">
+        <table class="live-table">
+          <thead>
+            <tr>
+              <th>timestamp</th><th>severity</th><th>category</th><th>event</th><th>action</th>
+              <th>outcome</th><th>src_ip</th><th>dst_ip</th><th>user</th><th>message</th><th>sender</th>
+            </tr>
+          </thead>
+          <tbody id="liveRecentBody"><tr><td colspan="11">Waiting for syslog events...</td></tr></tbody>
+        </table>
+      </div>
+      {export_panel}
+      <br><a href="/">Back</a>
+
+      <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+      <script>
+        (function() {{
+          const caseId = {js_case_id};
+          const refreshMs = 2000;
+          const recentColumns = ["timestamp", "severity", "log_category", "event", "action", "outcome", "src_ip", "dst_ip", "user", "message", "ingest_source"];
+
+          function cssVar(name) {{
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+          }}
+
+          function text(id, value) {{
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+          }}
+
+          function chartLayout(title) {{
+            return {{
+              title: {{ text: title, font: {{ size: 14 }} }},
+              paper_bgcolor: "rgba(0,0,0,0)",
+              plot_bgcolor: "rgba(0,0,0,0)",
+              font: {{ color: cssVar("--text") || "#d8fff2" }},
+              margin: {{ l: 54, r: 16, t: 46, b: 70 }},
+              xaxis: {{ automargin: true }},
+              yaxis: {{ rangemode: "tozero", automargin: true }}
+            }};
+          }}
+
+          function labels(items) {{
+            return (items || []).map(function(item) {{ return item.label; }});
+          }}
+
+          function values(items) {{
+            return (items || []).map(function(item) {{ return item.value; }});
+          }}
+
+          function formatBytes(value) {{
+            const amount = Number(value || 0);
+            if (!Number.isFinite(amount) || amount <= 0) return "0 B";
+            const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+            const idx = Math.min(Math.floor(Math.log(amount) / Math.log(1024)), units.length - 1);
+            const scaled = amount / Math.pow(1024, idx);
+            const digits = scaled >= 100 || idx === 0 ? 0 : (scaled >= 10 ? 1 : 2);
+            return scaled.toFixed(digits) + " " + units[idx];
+          }}
+
+          function renderBar(target, items, title, color) {{
+            const trace = {{
+              type: "bar",
+              x: labels(items),
+              y: values(items),
+              marker: {{ color: color }},
+              text: values(items),
+              textposition: "outside",
+              cliponaxis: false
+            }};
+            Plotly.react(target, [trace], chartLayout(title), {{ displayModeBar: false, responsive: true }});
+          }}
+
+          function renderTrafficBar(target, items, title, color) {{
+            const rawValues = values(items);
+            const trace = {{
+              type: "bar",
+              x: labels(items),
+              y: rawValues,
+              marker: {{ color: color }},
+              text: rawValues.map(formatBytes),
+              textposition: "outside",
+              cliponaxis: false,
+              hovertemplate: "%{{x}}<br>%{{text}} (%{{y}} bytes)<extra></extra>"
+            }};
+            const layout = chartLayout(title);
+            layout.yaxis.title = "Bytes";
+            Plotly.react(target, [trace], layout, {{ displayModeBar: false, responsive: true }});
+          }}
+
+          function renderPie(target, items, title) {{
+            const trace = {{
+              type: "pie",
+              labels: labels(items),
+              values: values(items),
+              hole: 0.35
+            }};
+            const layout = chartLayout(title);
+            layout.margin = {{ l: 20, r: 20, t: 46, b: 20 }};
+            Plotly.react(target, [trace], layout, {{ displayModeBar: false, responsive: true }});
+          }}
+
+          function renderTimeline(items) {{
+            const trace = {{
+              type: "scatter",
+              mode: "lines+markers",
+              x: labels(items),
+              y: values(items),
+              fill: "tozeroy",
+              line: {{ color: cssVar("--accent") || "#30f2b3" }}
+            }};
+            Plotly.react("liveTimelineChart", [trace], chartLayout("Events per Minute"), {{ displayModeBar: false, responsive: true }});
+          }}
+
+          function escapeHtml(value) {{
+            return String(value === undefined || value === null ? "" : value)
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#039;");
+          }}
+
+          function renderRecent(records) {{
+            const body = document.getElementById("liveRecentBody");
+            if (!body) return;
+            if (!records || !records.length) {{
+              body.innerHTML = "<tr><td colspan=\\"11\\">Waiting for syslog events...</td></tr>";
+              return;
+            }}
+            body.innerHTML = records.map(function(rec) {{
+              const cells = recentColumns.map(function(col) {{
+                return "<td>" + escapeHtml(rec[col]) + "</td>";
+              }}).join("");
+              return "<tr>" + cells + "</tr>";
+            }}).join("");
+          }}
+
+          function updateSummary(data) {{
+            text("liveTotalEvents", data.total_events || 0);
+            text("liveWindowEvents", data.window_events || 0);
+            text("liveCriticalHigh", data.critical_high || 0);
+            text("liveBlockedFailed", data.blocked_failed || 0);
+            text("liveUniqueSources", data.unique_sources || 0);
+            text("liveUniqueDestinations", data.unique_destinations || 0);
+            text("liveTrafficBytes", formatBytes(data.total_traffic_bytes || 0));
+            text("liveLastUpdated", "updated " + new Date().toLocaleTimeString());
+            if (data.listener) {{
+              text("liveListenerStatus", data.listener.status || "unknown");
+              text("liveListenerMessage", data.listener.message || "");
+            }}
+            renderBar("liveSeverityChart", data.severity, "Severity", ["#dc2626", "#ea580c", "#ca8a04", "#16a34a", "#0891b2"]);
+            renderBar("liveCategoryChart", data.categories, "Log Categories", cssVar("--accent") || "#30f2b3");
+            renderPie("liveOutcomeChart", data.outcomes, "Outcomes");
+            renderTimeline(data.timeline);
+            renderBar("liveSourceChart", data.top_sources, "Top Sources", "#38bdf8");
+            renderBar("liveDestinationChart", data.top_destinations, "Top Destinations", "#a78bfa");
+            renderTrafficBar("liveTrafficIpChart", data.top_traffic_ips, "Top 10 IPs by Traffic", "#22c55e");
+            renderTrafficBar("liveTrafficRuleChart", data.top_traffic_rules, "Top 10 Rules by Traffic", "#f59e0b");
+            renderRecent(data.recent);
+          }}
+
+          function fetchSummary() {{
+            fetch("/api/case/" + encodeURIComponent(caseId) + "/live_summary?limit=50&_=" + Date.now(), {{ cache: "no-store" }})
+              .then(function(res) {{ return res.json(); }})
+              .then(updateSummary)
+              .catch(function(err) {{
+                text("liveLastUpdated", "update failed");
+                text("liveListenerMessage", String(err && err.message ? err.message : err));
+              }});
+          }}
+
+          fetchSummary();
+          setInterval(fetchSummary, refreshMs);
+        }})();
+      </script>
+    """
+    return render_page(label, f"Live Syslog: {label}", content)
+
+
+@app.route("/live/<case_id>")
+def live_case(case_id):
+    ensure_syslog_listener_started()
+    case = get_case_by_sid(case_id)
+    if not case:
+        return render_page("Error", "Error", "Case not found.")
+    if not is_live_case(case):
+        return render_page("Error", "Error", "Case is not configured for live syslog ingestion.")
+    return render_live_case_page(case)
+
+
 @app.route("/case/<case_id>")
 def view_case(case_id):
     case_meta = get_case_by_sid(case_id)
     if not case_meta:
         return render_page("Error", "Error", "Case not found.")
+    if is_live_case(case_meta):
+        ensure_syslog_listener_started()
+        return render_live_case_page(case_meta)
 
     cached = get_cached_case_data(case_id)
     parse_state = get_case_parse_status(case_id)
@@ -2040,5 +3211,5 @@ def export_json():
     )
 
 if __name__ == "__main__":
+    ensure_syslog_listener_started()
     app.run(host="0.0.0.0", port=5000, debug=False)
-
