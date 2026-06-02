@@ -30,5 +30,6 @@ RUN mkdir -p /etc/nginx/certs && \
 EXPOSE 80
 EXPOSE 8443
 EXPOSE 5000
+EXPOSE 5514/udp
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
