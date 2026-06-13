@@ -2,10 +2,12 @@ import os
 import io
 import uuid
 import base64
+import hashlib
 import html
 import json
 import re
 import ipaddress
+import queue
 import shutil
 import socket
 import tarfile
@@ -13,6 +15,8 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 import pytz
 import pandas as pd
 import plotly.express as px
@@ -44,6 +48,14 @@ os.makedirs(UPLOADS, exist_ok=True)
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "testuser")
+ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://elasticsearch:9200").rstrip("/")
+ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX", "eflp-rag")
+INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://influxdb:8086").rstrip("/")
+INFLUXDB_DATABASE = os.environ.get("INFLUXDB_DATABASE", "eflp")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "granite4.1:8b")
+OLLAMA_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 PARSERS = {
     "palo_alto": PaloAltoParser,
@@ -283,6 +295,10 @@ SYSLOG_PACKET_BYTES = int(os.environ.get("EFLP_SYSLOG_PACKET_BYTES", "65535"))
 LIVE_CASE_CACHE_LIMIT = int(os.environ.get("EFLP_LIVE_CASE_CACHE_LIMIT", "100000"))
 LIVE_DASHBOARD_WINDOW = int(os.environ.get("EFLP_LIVE_DASHBOARD_WINDOW", "5000"))
 LIVE_RECENT_LIMIT = int(os.environ.get("EFLP_LIVE_RECENT_LIMIT", "50"))
+RAG_ENABLED = os.environ.get("EFLP_RAG_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+RAG_TOP_K = max(1, min(int(os.environ.get("EFLP_RAG_TOP_K", "8")), 25))
+RAG_CONTEXT_CHARS = max(2000, int(os.environ.get("EFLP_RAG_CONTEXT_CHARS", "16000")))
+RAG_QUEUE_SIZE = max(100, int(os.environ.get("EFLP_RAG_QUEUE_SIZE", "10000")))
 SYSLOG_ROUTES = []
 SYSLOG_ROUTE_LOCK = threading.Lock()
 SYSLOG_LISTENER_THREAD = None
@@ -295,6 +311,18 @@ SYSLOG_LISTENER_STATE = {
     "updated": time.time(),
 }
 PARSER_INSTANCES = {}
+RAG_INDEX_QUEUE = queue.Queue(maxsize=RAG_QUEUE_SIZE)
+RAG_INDEX_THREAD = None
+RAG_REINDEX_THREAD = None
+RAG_STATE_LOCK = threading.Lock()
+RAG_STATE = {
+    "enabled": RAG_ENABLED,
+    "status": "idle" if RAG_ENABLED else "disabled",
+    "message": "RAG indexing is ready." if RAG_ENABLED else "RAG indexing is disabled.",
+    "indexed_records": 0,
+    "failed_batches": 0,
+    "updated": time.time(),
+}
 
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -399,7 +427,7 @@ BASE_TEMPLATE = """
       margin: 10px 0;
       box-shadow: var(--shadow);
     }
-    input, select {
+    input, select, textarea {
       width: 100%;
       margin: 6px 0;
       padding: 10px 12px;
@@ -603,9 +631,103 @@ BASE_TEMPLATE = """
     .muted {
       color: var(--muted);
     }
+    .chat-shell {
+      display: grid;
+      grid-template-columns: minmax(220px, 280px) 1fr;
+      min-height: 620px;
+      overflow: hidden;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+    }
+    .chat-roster {
+      padding: 14px;
+      background: var(--panel-soft);
+      border-right: 1px solid var(--border);
+    }
+    .chat-roster h3, .chat-main h3 { margin-top: 0; }
+    .chat-contact {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--table-border);
+    }
+    .presence-dot {
+      width: 10px;
+      height: 10px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 10px rgba(34, 197, 94, 0.8);
+    }
+    .chat-main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-width: 0;
+    }
+    .chat-toolbar {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .chat-messages {
+      min-height: 360px;
+      max-height: 520px;
+      padding: 18px;
+      overflow-y: auto;
+      background: color-mix(in srgb, var(--panel) 94%, var(--bg) 6%);
+    }
+    .chat-message {
+      width: min(82%, 820px);
+      margin: 0 0 14px;
+      padding: 11px 13px;
+      border: 1px solid var(--table-border);
+      border-radius: 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .chat-message.user {
+      margin-left: auto;
+      background: color-mix(in srgb, var(--accent) 16%, var(--panel) 84%);
+    }
+    .chat-message.assistant {
+      margin-right: auto;
+      background: var(--panel-soft);
+    }
+    .chat-message .meta {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+    .chat-sources {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--table-border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .chat-composer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+      padding: 14px 16px;
+      border-top: 1px solid var(--border);
+    }
+    .chat-composer textarea {
+      min-height: 74px;
+      resize: vertical;
+    }
+    .chat-composer .button { min-width: 100px; }
     @media (max-width: 700px) {
       .chart-grid { grid-template-columns: 1fr; }
       .container { width: 94vw; }
+      .chat-shell { grid-template-columns: 1fr; }
+      .chat-roster { border-right: 0; border-bottom: 1px solid var(--border); }
+      .chat-composer { grid-template-columns: 1fr; }
+      .chat-message { width: 94%; }
     }
   </style>
   {{ datatables|safe }}
@@ -616,6 +738,7 @@ BASE_TEMPLATE = """
       <h1>{{ header }}</h1>
       <nav>
         <a href="/">Home</a>
+        <a href="/chat">Granite RAG Chat</a>
       </nav>
     </header>
     <main>
@@ -963,7 +1086,15 @@ def parse_case_background(case_id, file_path, vendor):
     try:
         parsed = parse_uploaded_file(file_path, vendor)
         set_cached_case_data(case_id, parsed)
-        set_case_parse_status(case_id, "ready", "Parsing complete.", records=len(parsed))
+        case = get_case_by_sid(case_id) or {
+            "sid": case_id,
+            "label": case_id,
+            "vendor": vendor,
+            "ingestion_mode": "upload",
+        }
+        queued = enqueue_rag_records(case, parsed)
+        message = "Parsing complete; RAG indexing queued." if queued else "Parsing complete."
+        set_case_parse_status(case_id, "ready", message, records=len(parsed))
     except Exception as e:
         set_case_parse_status(case_id, "error", f"{e}", records=0)
 
@@ -1529,6 +1660,15 @@ def handle_syslog_datagram(data, addr):
         try:
             record = parse_live_syslog_line(line, route["vendor"], source_ip=source_ip)
             append_live_case_record(route["case_id"], record)
+            enqueue_rag_records(
+                {
+                    "sid": route["case_id"],
+                    "label": route.get("label", "Live Syslog"),
+                    "vendor": route["vendor"],
+                    "ingestion_mode": "syslog",
+                },
+                [record],
+            )
             accepted += 1
         except Exception:
             errors += 1
@@ -1668,15 +1808,349 @@ def normalized_records_for_case(case, parsed_data):
     return norm_df.fillna("").to_dict("records")
 
 
+def create_elasticsearch_client(url=None, username="", password=""):
+    kwargs = {"request_timeout": 30}
+    if username and password:
+        kwargs["basic_auth"] = (username, password)
+    return Elasticsearch(url or ELASTICSEARCH_URL, **kwargs)
+
+
+def sanitize_elasticsearch_export_record(record):
+    cleaned = json.loads(json.dumps(record, default=str))
+    typed_fields = {
+        "timestamp", "severity_int", "src_ip", "dst_ip", "src_port", "dst_port",
+        "srcip", "dstip", "srcport", "dstport",
+    }
+    for field in typed_fields:
+        if cleaned.get(field) in (None, ""):
+            cleaned.pop(field, None)
+    if "raw_fields" in cleaned and not isinstance(cleaned["raw_fields"], dict):
+        cleaned.pop("raw_fields", None)
+    return cleaned
+
+
+def rag_index_mapping():
+    return {
+        "mappings": {
+            "dynamic": False,
+            "properties": {
+                "timestamp": {"type": "date", "ignore_malformed": True},
+                "indexed_at": {"type": "date"},
+                "case_id": {"type": "keyword"},
+                "case_label": {
+                    "type": "text",
+                    "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+                },
+                "vendor": {"type": "keyword"},
+                "ingestion_mode": {"type": "keyword"},
+                "severity": {"type": "keyword"},
+                "log_category": {"type": "keyword"},
+                "action": {"type": "keyword"},
+                "outcome": {"type": "keyword"},
+                "protocol": {"type": "keyword"},
+                "src_ip": {"type": "keyword"},
+                "dst_ip": {"type": "keyword"},
+                "event": {"type": "text"},
+                "message": {"type": "text"},
+                "raw_message": {"type": "text"},
+                "user": {"type": "text"},
+                "rule": {"type": "text"},
+                "signature": {"type": "text"},
+                "record_id": {"type": "keyword"},
+                "event_id": {"type": "keyword"},
+                "rag_text": {"type": "text"},
+            },
+        }
+    }
+
+
+def update_rag_state(status=None, message=None, indexed_delta=0, failed_delta=0, **extra):
+    with RAG_STATE_LOCK:
+        if status is not None:
+            RAG_STATE["status"] = status
+        if message is not None:
+            RAG_STATE["message"] = message
+        if indexed_delta:
+            RAG_STATE["indexed_records"] = int(RAG_STATE.get("indexed_records", 0)) + int(indexed_delta)
+        if failed_delta:
+            RAG_STATE["failed_batches"] = int(RAG_STATE.get("failed_batches", 0)) + int(failed_delta)
+        RAG_STATE.update(extra)
+        RAG_STATE["updated"] = time.time()
+
+
+def get_rag_state():
+    with RAG_STATE_LOCK:
+        state = dict(RAG_STATE)
+    state["queue_depth"] = RAG_INDEX_QUEUE.qsize()
+    state["index"] = ELASTICSEARCH_INDEX
+    state["elasticsearch_url"] = ELASTICSEARCH_URL
+    state["ollama_url"] = OLLAMA_URL
+    state["model"] = OLLAMA_MODEL
+    return state
+
+
+def rag_text_for_record(record):
+    fields = [
+        "case_label", "vendor", "timestamp", "severity", "log_category", "event",
+        "action", "outcome", "src_ip", "src_port", "dst_ip", "dst_port", "protocol",
+        "user", "rule", "signature", "message", "raw_message",
+    ]
+    chunks = []
+    for field in fields:
+        value = record.get(field, "")
+        if value not in (None, ""):
+            chunks.append(f"{field}: {value}")
+    return " | ".join(chunks)
+
+
+def prepare_rag_documents(case, records):
+    documents = []
+    case_id = str(case.get("sid", ""))
+    case_label = str(case.get("label", ""))
+    vendor = str(case.get("vendor", ""))
+    ingestion_mode = str(case.get("ingestion_mode", "upload") or "upload")
+    normalized = normalized_records_for_case(case, records)
+    for position, raw_record in enumerate(normalized):
+        record = json.loads(json.dumps(raw_record, default=str))
+        record["case_id"] = case_id
+        record["case_label"] = case_label
+        record["vendor"] = record.get("vendor") or vendor
+        record["ingestion_mode"] = record.get("ingestion_mode") or ingestion_mode
+        record["indexed_at"] = utc_now_iso()
+        record["rag_text"] = rag_text_for_record(record)
+        identity = {
+            "case_id": case_id,
+            "record_id": record.get("record_id", ""),
+            "event_id": record.get("event_id", ""),
+            "timestamp": record.get("timestamp", ""),
+            "message": record.get("message", ""),
+            "raw_message": record.get("raw_message", ""),
+            "position": position if len(normalized) > 1 else None,
+        }
+        document_id = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        documents.append({"_index": ELASTICSEARCH_INDEX, "_id": document_id, "_source": record})
+    return documents
+
+
+def index_rag_records(case, records):
+    if not RAG_ENABLED or not records:
+        return 0
+    client = create_elasticsearch_client()
+    if not client.indices.exists(index=ELASTICSEARCH_INDEX):
+        client.indices.create(index=ELASTICSEARCH_INDEX, body=rag_index_mapping())
+    actions = prepare_rag_documents(case, records)
+    if not actions:
+        return 0
+    succeeded, errors = helpers.bulk(
+        client.options(request_timeout=60),
+        actions,
+        chunk_size=500,
+        raise_on_error=False,
+    )
+    if errors:
+        update_rag_state(failed_delta=1, last_error=str(errors[0])[:500])
+    update_rag_state(
+        status="ready",
+        message=f"Indexed {succeeded} record(s) for case {case.get('label', case.get('sid', ''))}.",
+        indexed_delta=succeeded,
+    )
+    return succeeded
+
+
+def rag_index_worker():
+    while True:
+        item = RAG_INDEX_QUEUE.get()
+        try:
+            update_rag_state(status="indexing", message="Indexing newly ingested records for RAG.")
+            index_rag_records(item["case"], item["records"])
+        except Exception as exc:
+            attempts = int(item.get("attempts", 0)) + 1
+            update_rag_state(
+                status="degraded",
+                message=f"RAG indexing failed: {exc}",
+                failed_delta=1,
+                last_error=str(exc),
+            )
+            if attempts < 3:
+                item["attempts"] = attempts
+                time.sleep(attempts)
+                try:
+                    RAG_INDEX_QUEUE.put_nowait(item)
+                except queue.Full:
+                    update_rag_state(message="RAG retry queue is full; run a full sync from the chat page.")
+        finally:
+            RAG_INDEX_QUEUE.task_done()
+
+
+def ensure_rag_worker_started():
+    global RAG_INDEX_THREAD
+    if not RAG_ENABLED:
+        return
+    if RAG_INDEX_THREAD and RAG_INDEX_THREAD.is_alive():
+        return
+    RAG_INDEX_THREAD = threading.Thread(target=rag_index_worker, daemon=True)
+    RAG_INDEX_THREAD.start()
+
+
+def enqueue_rag_records(case, records):
+    if not RAG_ENABLED or not records:
+        return False
+    ensure_rag_worker_started()
+    try:
+        RAG_INDEX_QUEUE.put_nowait({"case": dict(case), "records": list(records), "attempts": 0})
+        return True
+    except queue.Full:
+        update_rag_state(
+            status="degraded",
+            message="RAG indexing queue is full; run a full sync from the chat page.",
+            failed_delta=1,
+        )
+        return False
+
+
+def reindex_all_cases_background():
+    try:
+        cases = get_all_cases()
+        update_rag_state(status="syncing", message=f"Syncing {len(cases)} case(s) into the RAG index.")
+        total = 0
+        failures = []
+        for case in cases:
+            loaded_case, records = load_case_data(str(case.get("sid", "")))
+            if not loaded_case:
+                failures.append(str(case.get("sid", "unknown")))
+                continue
+            try:
+                total += index_rag_records(loaded_case, records)
+            except Exception as exc:
+                failures.append(f"{case.get('sid', 'unknown')}: {exc}")
+        message = f"RAG sync complete: {total} record(s) indexed."
+        if failures:
+            message += f" {len(failures)} case(s) failed."
+        update_rag_state(
+            status="ready" if not failures else "degraded",
+            message=message,
+            last_error="; ".join(failures[:3]) if failures else "",
+        )
+    except Exception as exc:
+        update_rag_state(status="degraded", message=f"RAG sync failed: {exc}", last_error=str(exc), failed_delta=1)
+
+
+def start_rag_reindex():
+    global RAG_REINDEX_THREAD
+    if not RAG_ENABLED:
+        return False
+    if RAG_REINDEX_THREAD and RAG_REINDEX_THREAD.is_alive():
+        return False
+    RAG_REINDEX_THREAD = threading.Thread(target=reindex_all_cases_background, daemon=True)
+    RAG_REINDEX_THREAD.start()
+    return True
+
+
+def search_rag_records(question, case_id=""):
+    if not RAG_ENABLED or not str(question or "").strip():
+        return []
+    client = create_elasticsearch_client()
+    if not client.indices.exists(index=ELASTICSEARCH_INDEX):
+        return []
+    filters = []
+    if case_id:
+        filters.append({"term": {"case_id": str(case_id)}})
+    query = {
+        "bool": {
+            "must": [{
+                "multi_match": {
+                    "query": str(question)[:2000],
+                    "fields": ["rag_text^4", "message^3", "raw_message^2", "event^2", "rule", "user", "case_label"],
+                    "type": "best_fields",
+                    "operator": "or",
+                    "lenient": True,
+                }
+            }],
+            "filter": filters,
+        }
+    }
+    response = client.search(index=ELASTICSEARCH_INDEX, body={"size": RAG_TOP_K, "query": query})
+    return [hit.get("_source", {}) for hit in response.get("hits", {}).get("hits", [])]
+
+
+def build_rag_context(records):
+    context_parts = []
+    sources = []
+    used_chars = 0
+    for position, record in enumerate(records, start=1):
+        source = {
+            "number": position,
+            "case_id": str(record.get("case_id", "")),
+            "case_label": str(record.get("case_label", "")),
+            "timestamp": str(record.get("timestamp", "")),
+            "severity": str(record.get("severity", "")),
+            "event": str(record.get("event", "")),
+            "src_ip": str(record.get("src_ip", "")),
+            "dst_ip": str(record.get("dst_ip", "")),
+            "message": str(record.get("message", record.get("raw_message", "")))[:500],
+        }
+        line = (
+            f"[{position}] case={source['case_label']} case_id={source['case_id']} "
+            f"timestamp={source['timestamp']} severity={source['severity']} event={source['event']} "
+            f"src={source['src_ip']} dst={source['dst_ip']} message={source['message']}"
+        )
+        if used_chars + len(line) > RAG_CONTEXT_CHARS:
+            break
+        context_parts.append(line)
+        sources.append(source)
+        used_chars += len(line)
+    return "\n".join(context_parts), sources
+
+
+def call_ollama_chat(messages, context):
+    system_message = (
+        "You are the EFLP forensic analysis assistant. Answer concisely and distinguish observed log facts "
+        "from hypotheses. Use the retrieved EFLP records below when relevant and cite them with bracketed "
+        "source numbers such as [1]. If the records do not support a claim, say so. RAG retrieval updates "
+        "the context but does not retrain your model weights.\n\nRetrieved records:\n"
+        + (context or "No matching EFLP records were retrieved.")
+    )
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "system", "content": system_message}] + messages,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_ctx": OLLAMA_NUM_CTX},
+        "keep_alive": "10m",
+    }
+    req = urllib_request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {details[:500]}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Unable to reach Ollama at {OLLAMA_URL}: {exc.reason}") from exc
+    answer = str(result.get("message", {}).get("content", "")).strip()
+    if not answer:
+        raise RuntimeError("Ollama returned an empty response.")
+    return answer
+
+
 def generate_export_forms(case_id, vendor):
     default_target = build_case_export_target(vendor, case_id)
     safe_case_id = html.escape(str(case_id))
     safe_target = html.escape(default_target)
+    safe_es_url = html.escape(ELASTICSEARCH_URL)
+    safe_influx_url = html.escape(INFLUXDB_URL)
+    safe_influx_db = html.escape(INFLUXDB_DATABASE)
     es_form = f"""
     <form action="/export" method="post" style="margin-bottom:15px;">
       <input type="hidden" name="case_id" value="{safe_case_id}" />
       <label>Elasticsearch URL:</label>
-      <input type="text" name="es_url" value="http://localhost:9200" />
+      <input type="text" name="es_url" value="{safe_es_url}" />
       <label>Index:</label>
       <input type="text" name="es_index" value="{safe_target}" />
       <label>ES Username:</label>
@@ -1690,9 +2164,9 @@ def generate_export_forms(case_id, vendor):
     <form action="/export_influx" method="post" style="margin-bottom:15px;">
       <input type="hidden" name="case_id" value="{safe_case_id}" />
       <label>InfluxDB URL:</label>
-      <input type="text" name="influxdb_url" value="http://localhost:8086" />
+      <input type="text" name="influxdb_url" value="{safe_influx_url}" />
       <label>Database:</label>
-      <input type="text" name="influxdb_db" value="{safe_target}" />
+      <input type="text" name="influxdb_db" value="{safe_influx_db}" />
       <label>InfluxDB Username:</label>
       <input type="text" name="influxdb_user" />
       <label>InfluxDB Password:</label>
@@ -1719,6 +2193,7 @@ def generate_export_panel(case_id, vendor):
     return f"""
       <div class="panel">
         <h3>Export Pipelines</h3>
+        <p class="muted">Compose-internal service URLs are prefilled. From the host, use Elasticsearch at <code>http://localhost:9200</code> and InfluxDB at <code>http://localhost:8086</code>.</p>
         {export_forms}
       </div>
     """
@@ -1732,11 +2207,12 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
     points = []
     for rec in parsed_data:
         ts = rec.get("timestamp")
+        iso_time = None
         try:
-            dt = date_parser.parse(ts)
+            dt = date_parser.parse(str(ts))
             iso_time = dt.isoformat()
         except Exception:
-            iso_time = ts
+            pass
         point = {
             "measurement": "logs",
             "tags": {
@@ -1748,7 +2224,6 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
                 "action": rec.get("action", ""),
                 "outcome": rec.get("outcome", ""),
             },
-            "time": iso_time,
             "fields": {
                 "message": rec.get("message", ""),
                 "record_id": rec.get("record_id", ""),
@@ -1758,6 +2233,8 @@ def export_to_influxdb(parsed_data, vendor, influxdb_url, influxdb_db, influxdb_
                 "rule": rec.get("rule", "")
             }
         }
+        if iso_time:
+            point["time"] = iso_time
         points.append(point)
     client.write_points(points)
 
@@ -3117,10 +3594,215 @@ def view_case(case_id):
     """
     return render_page(label, f"Case: {label} ({vendor})", content, use_datatables=True)
 
+
+@app.route("/chat")
+def chat_page():
+    ensure_rag_worker_started()
+    cases = get_all_cases()
+    options = ["<option value=''>All indexed cases</option>"]
+    for case in cases:
+        case_id = html.escape(str(case.get("sid", "")), quote=True)
+        label = html.escape(str(case.get("label", "Untitled")))
+        vendor = html.escape(VENDOR_LABELS.get(str(case.get("vendor", "")), str(case.get("vendor", "unknown"))))
+        options.append(f"<option value='{case_id}'>{label} ({vendor})</option>")
+    case_options = "".join(options)
+    safe_model = html.escape(OLLAMA_MODEL)
+    safe_index = html.escape(ELASTICSEARCH_INDEX)
+    content = f"""
+      <div class="chat-shell">
+        <aside class="chat-roster">
+          <h3>Contacts</h3>
+          <div class="chat-contact">
+            <span class="presence-dot"></span>
+            <div><strong>granite4.1</strong><br><span class="muted">granite4.1@eflp.local</span></div>
+          </div>
+          <div class="chat-contact">
+            <span class="presence-dot"></span>
+            <div><strong>RAG index</strong><br><span class="muted">{safe_index}@elasticsearch.local</span></div>
+          </div>
+          <p class="muted" id="ragStatus">Checking local services...</p>
+          <button class="button secondary" id="ragSyncButton" type="button">Sync all cases</button>
+        </aside>
+        <section class="chat-main">
+          <div class="chat-toolbar">
+            <h3>Forensic room: eflp@conference.local</h3>
+            <label for="chatCase">Retrieval scope</label>
+            <select id="chatCase">{case_options}</select>
+            <span class="muted">Model: {safe_model}. Retrieved events are prompt context, not model-weight training.</span>
+          </div>
+          <div class="chat-messages" id="chatMessages" aria-live="polite">
+            <div class="chat-message assistant"><span class="meta">granite4.1@eflp.local</span>Ask about uploaded or live firewall events. I will retrieve matching EFLP records and cite them as numbered sources.</div>
+          </div>
+          <form class="chat-composer" id="chatForm">
+            <textarea id="chatInput" maxlength="6000" placeholder="Example: Summarize blocked connections and identify the most active source IPs." required></textarea>
+            <button class="button" type="submit" id="chatSend">Send</button>
+          </form>
+        </section>
+      </div>
+      <script>
+        (function() {{
+          const form = document.getElementById("chatForm");
+          const input = document.getElementById("chatInput");
+          const sendButton = document.getElementById("chatSend");
+          const messagesEl = document.getElementById("chatMessages");
+          const caseEl = document.getElementById("chatCase");
+          const statusEl = document.getElementById("ragStatus");
+          const syncButton = document.getElementById("ragSyncButton");
+          const history = [];
+
+          function escapeHtml(value) {{
+            return String(value === undefined || value === null ? "" : value)
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/\"/g, "&quot;")
+              .replace(/'/g, "&#039;");
+          }}
+
+          function addMessage(role, content, sources) {{
+            const node = document.createElement("div");
+            node.className = "chat-message " + role;
+            const jid = role === "user" ? "analyst@eflp.local" : "granite4.1@eflp.local";
+            let sourceHtml = "";
+            if (sources && sources.length) {{
+              sourceHtml = '<div class="chat-sources"><strong>Retrieved sources</strong><br>' + sources.map(function(source) {{
+                return "[" + escapeHtml(source.number) + "] " + escapeHtml(source.case_label || source.case_id) +
+                  " | " + escapeHtml(source.timestamp) + " | " + escapeHtml(source.severity) +
+                  " | " + escapeHtml(source.src_ip) + " -> " + escapeHtml(source.dst_ip);
+              }}).join("<br>") + "</div>";
+            }}
+            node.innerHTML = '<span class="meta">' + jid + '</span>' + escapeHtml(content) + sourceHtml;
+            messagesEl.appendChild(node);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return node;
+          }}
+
+          function refreshStatus() {{
+            fetch("/api/rag/status", {{ cache: "no-store" }})
+              .then(function(response) {{ return response.json(); }})
+              .then(function(state) {{
+                statusEl.textContent = state.status + ": " + state.message + " Queue: " + state.queue_depth + ".";
+              }})
+              .catch(function(error) {{ statusEl.textContent = "Status unavailable: " + error; }});
+          }}
+
+          syncButton.addEventListener("click", function() {{
+            syncButton.disabled = true;
+            fetch("/api/rag/reindex", {{ method: "POST" }})
+              .then(function(response) {{ return response.json(); }})
+              .then(function(result) {{ statusEl.textContent = result.message; }})
+              .catch(function(error) {{ statusEl.textContent = "Sync failed: " + error; }})
+              .finally(function() {{ syncButton.disabled = false; setTimeout(refreshStatus, 500); }});
+          }});
+
+          form.addEventListener("submit", function(event) {{
+            event.preventDefault();
+            const question = input.value.trim();
+            if (!question) return;
+            addMessage("user", question, []);
+            history.push({{ role: "user", content: question }});
+            input.value = "";
+            sendButton.disabled = true;
+            const pending = addMessage("assistant", "Retrieving EFLP records and querying the local model...", []);
+            fetch("/api/chat", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{ messages: history.slice(-12), case_id: caseEl.value }})
+            }})
+              .then(function(response) {{
+                return response.json().then(function(body) {{
+                  if (!response.ok) throw new Error(body.error || "Chat request failed");
+                  return body;
+                }});
+              }})
+              .then(function(body) {{
+                pending.remove();
+                addMessage("assistant", body.answer, body.sources || []);
+                history.push({{ role: "assistant", content: body.answer }});
+                if (body.warning) statusEl.textContent = body.warning;
+              }})
+              .catch(function(error) {{
+                pending.remove();
+                addMessage("assistant", "Error: " + error.message, []);
+              }})
+              .finally(function() {{ sendButton.disabled = false; input.focus(); refreshStatus(); }});
+          }});
+
+          input.addEventListener("keydown", function(event) {{
+            if (event.key === "Enter" && !event.shiftKey) {{
+              event.preventDefault();
+              form.requestSubmit();
+            }}
+          }});
+
+          refreshStatus();
+          setInterval(refreshStatus, 5000);
+        }})();
+      </script>
+    """
+    return render_page("Granite RAG Chat", "EFLP XMPP-style RAG Chat", content)
+
+
+@app.route("/api/rag/status")
+def api_rag_status():
+    return jsonify(get_rag_state())
+
+
+@app.route("/api/rag/reindex", methods=["POST"])
+def api_rag_reindex():
+    if not RAG_ENABLED:
+        return jsonify({"error": "RAG indexing is disabled."}), 400
+    started = start_rag_reindex()
+    if not started:
+        return jsonify({"message": "A full RAG sync is already running."}), 202
+    return jsonify({"message": "Full RAG sync started."}), 202
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    payload = request.get_json(silent=True) or {}
+    raw_messages = payload.get("messages", [])
+    if not isinstance(raw_messages, list):
+        return jsonify({"error": "messages must be an array."}), 400
+    messages = []
+    for item in raw_messages[-12:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", ""))
+        content = str(item.get("content", "")).strip()[:6000]
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    question = next((item["content"] for item in reversed(messages) if item["role"] == "user"), "")
+    if not question:
+        return jsonify({"error": "A user message is required."}), 400
+    case_id = str(payload.get("case_id", "")).strip()
+    if case_id and not CASE_ID_RE.fullmatch(case_id):
+        return jsonify({"error": "Invalid case_id."}), 400
+
+    retrieval_warning = ""
+    try:
+        records = search_rag_records(question, case_id=case_id)
+    except Exception as exc:
+        records = []
+        retrieval_warning = f"Elasticsearch retrieval was unavailable: {exc}"
+    context, sources = build_rag_context(records)
+    try:
+        answer = call_ollama_chat(messages, context)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+    return jsonify({
+        "answer": answer,
+        "sources": sources,
+        "warning": retrieval_warning,
+        "model": OLLAMA_MODEL,
+        "rag_index": ELASTICSEARCH_INDEX,
+    })
+
+
 @app.route("/export", methods=["POST"])
 def export_es():
     case_id = request.form.get("case_id")
-    es_url = request.form.get("es_url", "http://localhost:9200")
+    es_url = request.form.get("es_url", ELASTICSEARCH_URL)
     es_index = request.form.get("es_index", "logs")
     es_user = request.form.get("es_user", "")
     es_pass = request.form.get("es_pass", "")
@@ -3135,23 +3817,27 @@ def export_es():
             "Elasticsearch Export",
             f"No records available to export for case '{html.escape(case['label'])}'. <a href='/case/{case_id}'>Back</a>",
         )
-    if es_user and es_pass:
-        es = Elasticsearch([es_url], http_auth=(es_user, es_pass))
-    else:
-        es = Elasticsearch([es_url])
-    parser_instance = PARSERS.get(vendor)()
-    mapping = parser_instance.get_elasticsearch_mapping()
-    if not es.indices.exists(index=es_index):
-        es.indices.create(index=es_index, body=mapping, ignore=400)
-    actions = [{"_index": es_index, "_source": rec} for rec in export_records]
-    helpers.bulk(es, actions)
-    return render_page("Export Success", "Elasticsearch Export", f"Logs exported to Elasticsearch index '{es_index}'. <a href='/case/{case_id}'>Back</a>")
+    try:
+        es = create_elasticsearch_client(es_url, es_user, es_pass)
+        parser_instance = PARSERS.get(vendor)()
+        mapping = parser_instance.get_elasticsearch_mapping()
+        if not es.indices.exists(index=es_index):
+            es.indices.create(index=es_index, body=mapping)
+        actions = [
+            {"_index": es_index, "_source": sanitize_elasticsearch_export_record(rec)}
+            for rec in export_records
+        ]
+        helpers.bulk(es, actions)
+    except Exception as exc:
+        return render_page("Error", "Elasticsearch Export", f"Export failed: {html.escape(str(exc))}. <a href='/case/{case_id}'>Back</a>")
+    safe_index = html.escape(str(es_index))
+    return render_page("Export Success", "Elasticsearch Export", f"Logs exported to Elasticsearch index '{safe_index}'. <a href='/case/{case_id}'>Back</a>")
 
 @app.route("/export_influx", methods=["POST"])
 def export_influx():
     case_id = request.form.get("case_id")
-    influxdb_url = request.form.get("influxdb_url", "http://localhost:8086")
-    influxdb_db = request.form.get("influxdb_db", "logs")
+    influxdb_url = request.form.get("influxdb_url", INFLUXDB_URL)
+    influxdb_db = request.form.get("influxdb_db", INFLUXDB_DATABASE)
     influxdb_user = request.form.get("influxdb_user", "")
     influxdb_pass = request.form.get("influxdb_pass", "")
     case, parsed_data = load_case_data(case_id)
@@ -3177,8 +3863,9 @@ def export_influx():
             case_label=case.get("label", ""),
         )
     except Exception as e:
-        return render_page("Error", "Error", f"Error exporting to InfluxDB: {e}")
-    return render_page("Export Success", "InfluxDB Export", f"Logs exported to InfluxDB database '{influxdb_db}'. <a href='/case/{case_id}'>Back</a>")
+        return render_page("Error", "Error", f"Error exporting to InfluxDB: {html.escape(str(e))}")
+    safe_database = html.escape(str(influxdb_db))
+    return render_page("Export Success", "InfluxDB Export", f"Logs exported to InfluxDB database '{safe_database}'. <a href='/case/{case_id}'>Back</a>")
 
 @app.route("/export_csv", methods=["POST"])
 def export_csv():
@@ -3212,4 +3899,5 @@ def export_json():
 
 if __name__ == "__main__":
     ensure_syslog_listener_started()
+    ensure_rag_worker_started()
     app.run(host="0.0.0.0", port=5000, debug=False)
